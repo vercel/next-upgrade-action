@@ -6,6 +6,9 @@
     "format": "oxfmt",
     "format:check": "oxfmt --check"
   },
+  "dependencies": {
+    "semver": "7.8.6"
+  },
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@stylistic/eslint-plugin": "6.0.1",
