@@ -1,0 +1,204 @@
+name: Next.js upgrade
+
+on:
+  workflow_call:
+    inputs:
+      next-version:
+        description: Next.js version whose CLI checks the app; setup writes the installed version
+        required: true
+        type: string
+      app-path:
+        description: Repository-relative path of the app to upgrade
+        default: "."
+        type: string
+      policy:
+        description: Upgrade policy, security or latest
+        required: true
+        type: string
+      agent:
+        description: Hosted agent, codex or claude
+        required: true
+        type: string
+      auth:
+        description: Kind of agent-credential; only api-key is supported for now
+        default: api-key
+        type: string
+      telemetry-disabled:
+        description: Disable Next.js telemetry for this workflow and its child processes
+        default: false
+        type: boolean
+      model:
+        description: Agent model; empty uses the agent CLI default
+        default: ""
+        type: string
+      effort:
+        description: Agent reasoning effort; empty uses the model default
+        default: ""
+        type: string
+      next-preview-sha:
+        default: ""
+        type: string
+    secrets:
+      agent-credential:
+        required: true
+
+permissions: {}
+
+env:
+  NEXT_TELEMETRY_DISABLED: ${{ inputs.telemetry-disabled && '1' || '' }}
+
+concurrency:
+  group: next-upgrade-${{ github.repository }}-${{ inputs.policy }}-${{ inputs.app-path }}
+  cancel-in-progress: false
+
+jobs:
+  check-upgrade:
+    name: Check upgrade
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.check-upgrade.outputs.status }}
+      base-sha: ${{ steps.check-upgrade.outputs.base-sha }}
+      candidate-id: ${{ steps.check-upgrade.outputs.candidate-id }}
+      default-branch: ${{ steps.branch.outputs.name }}
+    steps:
+      - name: Look up the default branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          branch="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+          test -n "$branch"
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+      - name: Check out the consumer
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: consumer
+          ref: ${{ steps.branch.outputs.name }}
+          persist-credentials: false
+      - name: Check out the pinned action scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: action
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install the pinned Next.js package
+        working-directory: action
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+          NEXT_VERSION: ${{ inputs.next-version }}
+          NEXT_PREVIEW_SHA: ${{ inputs.next-preview-sha }}
+        run: node scripts/install-next.mjs
+      - name: Check whether an upgrade is needed
+        id: check-upgrade
+        env:
+          NEXT_UPGRADE_STAGE: check-upgrade
+          NEXT_UPGRADE_ROOT: ${{ github.workspace }}/consumer
+          NEXT_UPGRADE_CLI_PATH: ${{ github.workspace }}/action/node_modules/next/dist/bin/next
+          NEXT_UPGRADE_APP_PATH: ${{ inputs.app-path }}
+          NEXT_UPGRADE_POLICY: ${{ inputs.policy }}
+        run: node action/scripts/upgrade.mjs
+
+  run-upgrade:
+    name: Run upgrade
+    needs: check-upgrade
+    if: ${{ needs.check-upgrade.outputs.status == 'ready' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the consumer base commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: consumer
+          ref: ${{ needs.check-upgrade.outputs.base-sha }}
+          persist-credentials: false
+      - name: Check out the pinned action scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: action
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install the pinned Next.js package
+        working-directory: action
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+          NEXT_VERSION: ${{ inputs.next-version }}
+          NEXT_PREVIEW_SHA: ${{ inputs.next-preview-sha }}
+        run: node scripts/install-next.mjs
+      - name: Install the selected agent
+        env:
+          NEXT_UPGRADE_AGENT: ${{ inputs.agent }}
+        run: |
+          set -euo pipefail
+          case "$NEXT_UPGRADE_AGENT" in
+            codex)
+              npm install --global --ignore-scripts @openai/codex@0.161.0
+              ;;
+            claude)
+              npm install --global --ignore-scripts @anthropic-ai/claude-code@2.1.293
+              node "$(npm root --global)/@anthropic-ai/claude-code/install.cjs"
+              ;;
+            *)
+              echo 'Use codex or claude for agent.' >&2
+              exit 1
+              ;;
+          esac
+      - name: Allow the Codex sandbox
+        if: ${{ inputs.agent == 'codex' }}
+        run: |
+          set -euo pipefail
+          for setting in kernel.unprivileged_userns_clone=1 kernel.apparmor_restrict_unprivileged_userns=0; do
+            if sudo sysctl -n "${setting%%=*}" >/dev/null 2>&1; then
+              sudo sysctl -w "$setting"
+            fi
+          done
+      - name: Create the agent user
+        run: |
+          set -euo pipefail
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin next-upgrade-agent
+          sudo chmod -R go-w /opt/hostedtoolcache "$(npm config get prefix)"
+          for dir in "$(dirname "$(command -v node)")" /usr/bin /bin; do
+            if sudo -n -u next-upgrade-agent test -w "$dir"; then
+              echo "The agent user can write to $dir on its PATH." >&2
+              exit 1
+            fi
+          done
+      - name: Upgrade Next.js with the agent
+        env:
+          NEXT_UPGRADE_STAGE: run-upgrade
+          NEXT_UPGRADE_ROOT: ${{ github.workspace }}/consumer
+          NEXT_UPGRADE_ARTIFACT_DIR: ${{ runner.temp }}/next-upgrade-candidates
+          NEXT_UPGRADE_CLI_PATH: ${{ github.workspace }}/action/node_modules/next/dist/bin/next
+          NEXT_UPGRADE_APP_PATH: ${{ inputs.app-path }}
+          NEXT_UPGRADE_POLICY: ${{ inputs.policy }}
+          NEXT_UPGRADE_AGENT: ${{ inputs.agent }}
+          NEXT_UPGRADE_AUTH: ${{ inputs.auth }}
+          NEXT_UPGRADE_MODEL: ${{ inputs.model }}
+          NEXT_UPGRADE_EFFORT: ${{ inputs.effort }}
+          NEXT_UPGRADE_AGENT_CREDENTIAL: ${{ secrets.agent-credential }}
+        run: node action/scripts/upgrade.mjs
+      - name: Upload the upgrade candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: next-upgrade-${{ needs.check-upgrade.outputs.candidate-id }}
+          path: ${{ runner.temp }}/next-upgrade-candidates/
+          if-no-files-found: error
+          retention-days: 1
