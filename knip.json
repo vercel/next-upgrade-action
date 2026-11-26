@@ -1,5 +1,10 @@
 {
   "$schema": "https://unpkg.com/knip@6/schema.json",
-  "entry": ["scripts/install-next.mjs", "scripts/upgrade.mjs", "scripts/pull-request.mjs"],
+  "entry": [
+    "scripts/install-next.mjs",
+    "scripts/upgrade.mjs",
+    "scripts/pull-request.mjs",
+    "scripts/run-agent.mjs"
+  ],
   "project": ["scripts/**/*.mjs"]
 }
