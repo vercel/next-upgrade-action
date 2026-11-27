@@ -144,7 +144,7 @@ if (enabled) {
       test(`${scenario.name} agent`, { timeout: 300_000 }, async (t) => {
         const work = await tempDirectory({ t, prefix: "next-upgrade-e2e-" });
         // The upgrade script keeps its scratch and the agent home under TMPDIR, so the agent
-        // user has to be able to traverse it, and it must be empty again afterwards.
+        // user has to be able to traverse it, and none of the run's files may remain afterwards.
         const scratchParent = await tempDirectory({ t, prefix: "next-upgrade-e2e-tmp-" });
         await chmod(scratchParent, 0o755);
         const consumer = join(work, "consumer");
@@ -222,7 +222,11 @@ if (enabled) {
         // file the agent owned was reclaimed so the scratch could be removed.
         assert.equal(await agentProcesses(), "");
         assert.deepEqual(await snapshotTree({ directory: consumer }), consumerBefore);
-        assert.deepEqual(await readdir(scratchParent), []);
+        // npm keeps its own node-compile-cache there, so only the upgrade script's entries count.
+        assert.deepEqual(
+          (await readdir(scratchParent)).filter((entry) => entry.startsWith("next-upgrade-")),
+          [],
+        );
         assert.deepEqual(await replyDirectories(), repliesBefore);
         for (const entry of consumerBefore) {
           assert.equal(entry.uid, process.getuid(), entry.path);

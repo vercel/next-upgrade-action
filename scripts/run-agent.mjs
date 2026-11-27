@@ -230,7 +230,7 @@ export async function stopAgent() {
   let killError = null;
   try {
     await sudo({
-      args: ["-u", agentUser, systemCommand("kill"), "-s", "KILL", "--", "-1"],
+      args: ["-u", agentUser, systemCommand("pkill"), "-KILL", "-u", agentUser],
       description: "Stopping agent processes",
     });
   } catch (error) {
