@@ -41,6 +41,8 @@ on:
     secrets:
       agent-credential:
         required: true
+      publish-token:
+        required: true
 
 permissions: {}
 
@@ -52,9 +54,57 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  check-open-pull-request:
+    name: Check open pull request
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      default-branch: ${{ steps.check-open-pull-request.outputs.default-branch }}
+      pull-request: ${{ steps.check-open-pull-request.outputs.pull-request }}
+    steps:
+      - name: Check the publication token
+        env:
+          PUBLISH_TOKEN_PROVIDED: ${{ secrets.publish-token != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$PUBLISH_TOKEN_PROVIDED" != true ]; then
+            echo 'Register a fine-grained personal access token with contents and pull-requests write access as the NEXT_UPGRADE_PUBLISH_TOKEN secret.' >&2
+            exit 1
+          fi
+      - name: Check out the pinned action scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: action
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install the action dependencies
+        working-directory: action
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+          NEXT_UPGRADE_DEPS_ONLY: "true"
+        run: node scripts/install-next.mjs
+      - name: Check for an open upgrade pull request
+        id: check-open-pull-request
+        env:
+          NEXT_UPGRADE_STAGE: check-open-pull-request
+          NEXT_UPGRADE_APP_PATH: ${{ inputs.app-path }}
+          NEXT_UPGRADE_POLICY: ${{ inputs.policy }}
+          GH_TOKEN: ${{ secrets.publish-token }}
+        run: node action/scripts/pull-request.mjs
+
   check-upgrade:
     name: Check upgrade
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    needs: check-open-pull-request
+    if: ${{ needs.check-open-pull-request.outputs.pull-request == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -63,22 +113,12 @@ jobs:
       status: ${{ steps.check-upgrade.outputs.status }}
       base-sha: ${{ steps.check-upgrade.outputs.base-sha }}
       candidate-id: ${{ steps.check-upgrade.outputs.candidate-id }}
-      default-branch: ${{ steps.branch.outputs.name }}
     steps:
-      - name: Look up the default branch
-        id: branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          branch="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
-          test -n "$branch"
-          echo "name=$branch" >> "$GITHUB_OUTPUT"
       - name: Check out the consumer
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           path: consumer
-          ref: ${{ steps.branch.outputs.name }}
+          ref: ${{ needs.check-open-pull-request.outputs.default-branch }}
           persist-credentials: false
       - name: Check out the pinned action scripts
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -202,3 +242,51 @@ jobs:
           path: ${{ runner.temp }}/next-upgrade-candidates/
           if-no-files-found: error
           retention-days: 1
+
+  open-pull-request:
+    name: Open pull request
+    needs: [check-open-pull-request, check-upgrade, run-upgrade]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the consumer base commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          path: consumer
+          ref: ${{ needs.check-upgrade.outputs.base-sha }}
+          persist-credentials: false
+      - name: Check out the pinned action scripts
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: action
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install the action dependencies
+        working-directory: action
+        env:
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+          NEXT_UPGRADE_DEPS_ONLY: "true"
+        run: node scripts/install-next.mjs
+      - name: Download candidates
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: next-upgrade-${{ needs.check-upgrade.outputs.candidate-id }}
+          path: ${{ runner.temp }}/next-upgrade-candidates
+      - name: Open the upgrade pull request
+        env:
+          NEXT_UPGRADE_STAGE: open-pull-request
+          NEXT_UPGRADE_ROOT: ${{ github.workspace }}/consumer
+          NEXT_UPGRADE_ARTIFACT_DIR: ${{ runner.temp }}/next-upgrade-candidates
+          NEXT_UPGRADE_BASE_BRANCH: ${{ needs.check-open-pull-request.outputs.default-branch }}
+          NEXT_UPGRADE_APP_PATH: ${{ inputs.app-path }}
+          NEXT_UPGRADE_POLICY: ${{ inputs.policy }}
+          GH_TOKEN: ${{ secrets.publish-token }}
+        run: node action/scripts/pull-request.mjs
