@@ -175,6 +175,10 @@ async function fakeAgent() {
       break;
     }
 
+    case "crash":
+      process.exit(7);
+      break;
+
     default:
       break;
   }
