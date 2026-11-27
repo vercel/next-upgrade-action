@@ -139,8 +139,6 @@ jobs:
           NEXT_VERSION: ${{ inputs.next-version }}
           NEXT_PREVIEW_SHA: ${{ inputs.next-preview-sha }}
         run: node scripts/install-next.mjs
-      - name: Install the package managers
-        run: npm install --global --ignore-scripts pnpm@12.23.0 yarn@1.22.22
       - name: Create the agent user
         run: |
           set -euo pipefail
@@ -196,8 +194,6 @@ jobs:
           NEXT_VERSION: ${{ inputs.next-version }}
           NEXT_PREVIEW_SHA: ${{ inputs.next-preview-sha }}
         run: node scripts/install-next.mjs
-      - name: Install the package managers
-        run: npm install --global --ignore-scripts pnpm@12.23.0 yarn@1.22.22
       - name: Install the selected agent
         env:
           NEXT_UPGRADE_AGENT: ${{ inputs.agent }}

@@ -30,6 +30,7 @@ const lockfiles = {
   "pnpm-lock.yaml": "pnpm",
   "yarn.lock": "yarn",
 };
+const packageManagers = { pnpm: "pnpm@12.23.0", yarn: "yarn@1.22.22" };
 const unsupportedFiles = ["npm-shrinkwrap.json", "bun.lock", "bun.lockb", "pnpm-workspace.yaml"];
 export function normalizeUpgradePath(path) {
   if (
@@ -345,6 +346,22 @@ async function checkUpgradeAt({
     pnpm: ["install", "--frozen-lockfile", "--ignore-scripts", "--ignore-pnpmfile"],
     yarn: ["install", "--frozen-lockfile", "--ignore-scripts", "--non-interactive"],
   };
+  if (Object.hasOwn(packageManagers, manager)) {
+    await run({
+      file: "npm",
+      args: [
+        "install",
+        "--global",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        packageManagers[manager],
+      ],
+      cwd: privateRoot,
+      description: `Installing ${manager}`,
+    });
+  }
+
   const installHome = join(scratch, `${id}-install-home`);
   await mkdir(installHome);
   for (const path of [candidateRoot, installHome]) {
