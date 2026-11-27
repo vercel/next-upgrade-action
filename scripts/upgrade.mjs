@@ -25,13 +25,12 @@ import { commandEnv, run, sudo, systemCommand, systemPath } from "./process.mjs"
 import { agentUser, proxyTokenPattern, runAgent } from "./run-agent.mjs";
 
 const policies = new Set(["security", "latest"]);
-const otherLockfiles = [
-  "npm-shrinkwrap.json",
-  "yarn.lock",
-  "pnpm-lock.yaml",
-  "bun.lock",
-  "bun.lockb",
-];
+const lockfiles = {
+  "package-lock.json": "npm",
+  "pnpm-lock.yaml": "pnpm",
+  "yarn.lock": "yarn",
+};
+const unsupportedFiles = ["npm-shrinkwrap.json", "bun.lock", "bun.lockb", "pnpm-workspace.yaml"];
 export function normalizeUpgradePath(path) {
   if (
     typeof path !== "string" ||
@@ -309,29 +308,50 @@ async function checkUpgradeAt({
   stage.name = "setup";
   const baseRoot = join(privateRoot, "base");
   await checkout({ source: root, root: baseRoot, baseSha });
-  const lockfile = await statIfExists(join(baseRoot, path, "package-lock.json"));
-  if (!lockfile || !lockfile.isFile()) {
+  for (const file of unsupportedFiles) {
+    if (await statIfExists(join(baseRoot, path, file))) {
+      throw new Error(`Scheduled upgrades do not support ${file} yet.`);
+    }
+  }
+
+  const found = [];
+  for (const file of Object.keys(lockfiles)) {
+    const info = await statIfExists(join(baseRoot, path, file));
+    if (info && info.isFile()) {
+      found.push(file);
+    }
+  }
+
+  if (found.length !== 1) {
     throw new Error(
-      "Scheduled upgrades need a committed package-lock.json next to the app package.json on the default branch.",
+      "Scheduled upgrades need exactly one committed package-lock.json, pnpm-lock.yaml, or yarn.lock next to the app package.json on the default branch.",
     );
   }
 
-  for (const lockfile of otherLockfiles) {
-    if (await statIfExists(join(baseRoot, path, lockfile))) {
-      throw new Error(
-        `Scheduled upgrades need package-lock.json as the only lockfile, and the app also has ${lockfile}.`,
-      );
-    }
+  const manager = lockfiles[found[0]];
+  if (
+    manager === "yarn" &&
+    (await readFile(join(baseRoot, path, "yarn.lock"), "utf8")).includes("\n__metadata:")
+  ) {
+    throw new Error(
+      "Scheduled upgrades support Yarn 1, and the app uses a Yarn 2 or later lockfile.",
+    );
   }
 
   const id = candidateKey({ path, policy });
   const candidateRoot = join(scratch, id);
   const appDirectory = join(candidateRoot, path);
   await checkout({ source: root, root: candidateRoot, baseSha });
+  const installArgs = {
+    npm: ["ci", `--git=${systemCommand("git")}`, "--ignore-scripts", "--no-audit", "--no-fund"],
+    pnpm: ["install", "--frozen-lockfile", "--ignore-scripts", "--ignore-pnpmfile"],
+    yarn: ["install", "--frozen-lockfile", "--ignore-scripts", "--non-interactive"],
+  };
   await run({
-    file: "npm",
-    args: ["ci", `--git=${systemCommand("git")}`, "--ignore-scripts", "--no-audit", "--no-fund"],
+    file: manager,
+    args: installArgs[manager],
     cwd: appDirectory,
+    env: { ...commandEnv(), YARN_IGNORE_PATH: "1" },
     description: "Dependency install",
   });
   const installedStatus = await git({ cwd: candidateRoot, args: ["status", "--porcelain", "-z"] });
@@ -489,23 +509,29 @@ async function runUpgrade({
 
     await copyTree({ source: candidateRoot, destination: snapshotRoot });
     const patch = await candidatePatch({ root: snapshotRoot, baseRoot, baseSha, credential });
-    const lockfile = parseJson({
+    const manifest = parseJson({
       value: (
         await git({
           cwd: snapshotRoot,
-          args: ["cat-file", "blob", `:${posix.join(path, "package-lock.json")}`],
+          args: ["cat-file", "blob", `:${posix.join(path, "package.json")}`],
         })
       ).toString("utf8"),
-      description: "candidate package-lock.json",
+      description: "candidate package.json",
     });
-    const packages = lockfile !== null && typeof lockfile === "object" ? lockfile.packages : null;
-    const lockedNext =
-      packages !== null && typeof packages === "object" ? packages["node_modules/next"] : null;
-    const lockedVersion =
-      lockedNext !== null && typeof lockedNext === "object" ? lockedNext.version : undefined;
-    if (lockedVersion !== handoff.targetVersion) {
+    const declared = ["dependencies", "devDependencies"]
+      .map((field) =>
+        manifest !== null && typeof manifest === "object" && typeof manifest[field] === "object"
+          ? Object(manifest[field]).next
+          : undefined,
+      )
+      .find((specifier) => specifier !== undefined);
+    if (
+      typeof declared !== "string" ||
+      semver.validRange(declared) === null ||
+      semver.minVersion(declared).version !== handoff.targetVersion
+    ) {
       throw new Error(
-        `The candidate locks next to ${lockedVersion} instead of ${handoff.targetVersion}.`,
+        `The candidate package.json requires next ${declared} instead of ${handoff.targetVersion}.`,
       );
     }
 
