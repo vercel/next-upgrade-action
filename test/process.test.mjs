@@ -16,13 +16,18 @@ async function failure({ file, args, timeout }) {
   throw new Error("The command did not fail.");
 }
 
-test("a failed command does not log its arguments", async () => {
+test("a failed command keeps its stderr but not its arguments", async () => {
   const error = await failure({
     file: systemCommand("sh"),
-    args: ["-c", "exit 3", `TOKEN=${secret}`],
+    args: ["-c", "echo first >&2; echo 'could not parse' >&2; exit 3", `TOKEN=${secret}`],
   });
   assert.equal(error.message, "Probe failed.");
-  assert.deepEqual(error.cause, { code: 3, signal: null, killed: false });
+  assert.deepEqual(error.cause, {
+    code: 3,
+    signal: null,
+    killed: false,
+    stderr: "first\ncould not parse",
+  });
   assert.doesNotMatch(inspect(error, { depth: Infinity }), /next-upgrade-a{48}/u);
 });
 
@@ -42,4 +47,13 @@ test("a timed out command does not log its arguments", async () => {
   assert.equal(error.message, "Probe timed out.");
   assert.equal(error.cause.killed, true);
   assert.doesNotMatch(inspect(error, { depth: Infinity }), /next-upgrade-a{48}/u);
+});
+
+test("a failed command keeps only the end of a long stderr", async () => {
+  const error = await failure({
+    file: systemCommand("sh"),
+    args: ["-c", "head -c 5000 /dev/zero | tr '\\0' x >&2; echo END >&2; exit 1"],
+  });
+  assert.equal(error.cause.stderr.length, 2000);
+  assert.match(error.cause.stderr, /xEND$/u);
 });
