@@ -252,6 +252,33 @@ export async function stopAgent() {
   throw new Error("Could not stop the agent processes.");
 }
 
+export function runAsAgentUser({ file, args, env, ...options }) {
+  return run({
+    ...options,
+    file: systemCommand("sudo"),
+    args: [
+      "-n",
+      systemCommand("unshare"),
+      "--pid",
+      "--fork",
+      "--mount-proc",
+      systemCommand("setpriv"),
+      `--reuid=${agentUser}`,
+      `--regid=${agentUser}`,
+      "--init-groups",
+      "--no-new-privs",
+      "--inh-caps=-all",
+      "--bounding-set=-all",
+      systemCommand("env"),
+      "-i",
+      ...Object.entries(env).map(([name, value]) => `${name}=${value}`),
+      file,
+      ...args,
+    ],
+    env: commandEnv(),
+  });
+}
+
 export async function runAgent({
   agent,
   auth,
@@ -351,33 +378,6 @@ exclude = ["NEXT_UPGRADE_PROXY_TOKEN"]
       });
     }
 
-    const envArgs = Object.entries(env).map(([name, value]) => `${name}=${value}`);
-    const runAsAgentUser = ({ file, args, ...options }) =>
-      run({
-        ...options,
-        file: systemCommand("sudo"),
-        args: [
-          "-n",
-          systemCommand("unshare"),
-          "--pid",
-          "--fork",
-          "--mount-proc",
-          systemCommand("setpriv"),
-          `--reuid=${agentUser}`,
-          `--regid=${agentUser}`,
-          "--init-groups",
-          "--no-new-privs",
-          "--inh-caps=-all",
-          "--bounding-set=-all",
-          systemCommand("env"),
-          "-i",
-          ...envArgs,
-          file,
-          ...args,
-        ],
-        env: commandEnv(),
-      });
-
     const modelArgs = model === undefined ? [] : ["--model", model];
     if (effort !== undefined) {
       modelArgs.push(
@@ -387,6 +387,7 @@ exclude = ["NEXT_UPGRADE_PROXY_TOKEN"]
 
     const instructions = `The checkout is ${JSON.stringify(root)}. Run the app commands from ${JSON.stringify(cwd)}.\n\n${prompt}\n\nWhen you finish, report the result. Set verified to true only after every required installation and app check passed. Otherwise set verified to false and explain the failure in summary.`;
     const agentOptions = {
+      env,
       cwd: home,
       timeout: agentTimeout,
       showOutputOnFailure: true,

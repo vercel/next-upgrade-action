@@ -176,7 +176,7 @@ export function pullRequestBody({ target, runUrl }) {
     "",
     "### Verification",
     "",
-    `The hosted agent followed the Next.js upgrade guides and reported that the app's installation and checks passed. The workflow then checked that package-lock.json locks next to ${targetVersion} and that the change touches no workflow files, submodules, symlinks, or file modes and contains no agent credential.`,
+    `The hosted agent followed the Next.js upgrade guides and reported that the app's installation and checks passed. The workflow then checked that package.json requires next ${targetVersion} and that the change touches no workflow files, submodules, symlinks, or file modes and contains no agent credential.`,
     "",
     "Review the changes and run your own checks before merging.",
     "",

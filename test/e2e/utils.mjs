@@ -28,7 +28,7 @@ import { promisify } from "node:util";
 
 import { agentUser, proxyTokenPattern } from "../../scripts/run-agent.mjs";
 import { candidateKey } from "../../scripts/upgrade.mjs";
-import { createRepository, scriptsDirectory, tempDirectory } from "../helpers.mjs";
+import { createRepository, git, scriptsDirectory, tempDirectory } from "../helpers.mjs";
 
 export const exec = promisify(execFile);
 export const installedVersion = "15.5.0";
@@ -149,15 +149,31 @@ async function fakeAgent() {
     const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
     manifest.dependencies = { next: version };
     fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-    const lockPath = path.join(root, "package-lock.json");
-    const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-    lock.packages[""].dependencies = { next: version };
-    lock.packages["node_modules/next"] = {
-      version,
-      resolved: `https://registry.npmjs.org/next/-/next-${version}.tgz`,
-      license: "MIT",
-    };
-    fs.writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+    if (fs.existsSync(path.join(root, "yarn.lock"))) {
+      fs.appendFileSync(
+        path.join(root, "yarn.lock"),
+        `next@${version}:\n  version "${version}"\n  resolved "https://registry.yarnpkg.com/next/-/next-${version}.tgz"\n`,
+      );
+    } else if (fs.existsSync(path.join(root, "pnpm-lock.yaml"))) {
+      const lock = fs.readFileSync(path.join(root, "pnpm-lock.yaml"), "utf8");
+      fs.writeFileSync(
+        path.join(root, "pnpm-lock.yaml"),
+        lock.replace(
+          "  .: {}\n",
+          `  .:\n    dependencies:\n      next:\n        specifier: ${version}\n        version: ${version}\n`,
+        ),
+      );
+    } else {
+      const lockPath = path.join(root, "package-lock.json");
+      const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+      lock.packages[""].dependencies = { next: version };
+      lock.packages["node_modules/next"] = {
+        version,
+        resolved: `https://registry.npmjs.org/next/-/next-${version}.tgz`,
+        license: "MIT",
+      };
+      fs.writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+    }
   };
 
   if (scenario !== "nothing") {
@@ -326,16 +342,14 @@ async function fixtureFiles({ directory }) {
   return files;
 }
 
-// Registers the suite, or one skipped test where the machine is not prepared for it.
-export function describeE2e({ name, suite }) {
-  if (!enabled) {
-    test(name, {
-      skip: "Set NEXT_UPGRADE_E2E=1 on a Linux machine prepared like .github/workflows/e2e-test.yml.",
-    });
-    return;
-  }
+const skip =
+  "Set NEXT_UPGRADE_E2E=1 on a Linux machine prepared like .github/workflows/e2e-test.yml.";
 
-  describe(name, suite);
+// A describe that registers one skipped test where the machine is not prepared for it.
+export const describeStage = enabled ? describe : (name) => test(name, { skip });
+
+export function describeE2e({ name, suite }) {
+  describeStage(name, suite);
 }
 
 // Installs the fake agent and model API around the suite, and returns `upgrade`, which commits a
@@ -454,4 +468,44 @@ export function upgradeTestSetup({ files }) {
   };
 
   return { upgrade };
+}
+
+// A prepared run leaves exactly its patch, which applies to the fixture and only moves next to the
+// target version in package.json and the app's lockfile.
+export async function assertPrepared({ run, lockfile }) {
+  assert.equal(run.code, 0, run.output);
+  assert.deepEqual(run.index, {
+    baseSha: run.baseSha,
+    status: "prepared",
+    candidate: { id: run.id, fromVersion: installedVersion, targetVersion },
+  });
+  assert.deepEqual((await readdir(run.artifacts)).sort(), [`${run.id}.patch`, "index.json"]);
+  const applied = join(run.work, "applied");
+  git({ cwd: run.work, args: ["clone", "--quiet", run.consumer, applied] });
+  git({ cwd: applied, args: ["apply", "--index", join(run.artifacts, `${run.id}.patch`)] });
+  assert.deepEqual(
+    git({ cwd: applied, args: ["diff", "--cached", "--name-only"] })
+      .toString()
+      .trim()
+      .split("\n"),
+    [lockfile, "package.json"].sort(),
+  );
+  const manifest = JSON.parse(await readFile(join(applied, "package.json"), "utf8"));
+  assert.equal(manifest.dependencies.next, targetVersion);
+  assert.match(await readFile(join(applied, lockfile), "utf8"), new RegExp(targetVersion, "u"));
+}
+
+// The upstream only ever saw the real credential: once from the key check and once through the
+// proxy, never the proxy token.
+export function assertModelRequests({ run }) {
+  assert.deepEqual(
+    run.requests.map(({ method, url }) => `${method} ${url}`),
+    ["GET /v1/models", "GET /v1/models"],
+  );
+  for (const { headers } of run.requests) {
+    assert.equal(headers["x-api-key"], run.credential);
+    assert.equal(headers["anthropic-version"], "2023-06-01");
+    assert.equal(headers.authorization, undefined);
+    assert.doesNotMatch(JSON.stringify(headers), proxyTokenPattern);
+  }
 }

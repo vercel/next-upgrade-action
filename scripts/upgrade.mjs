@@ -16,22 +16,22 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, posix } from "node:path";
+import { dirname, join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import semver from "semver";
 
 import { commandEnv, run, sudo, systemCommand, systemPath } from "./process.mjs";
-import { agentUser, proxyTokenPattern, runAgent } from "./run-agent.mjs";
+import { agentUser, proxyTokenPattern, runAgent, runAsAgentUser } from "./run-agent.mjs";
 
 const policies = new Set(["security", "latest"]);
-const otherLockfiles = [
-  "npm-shrinkwrap.json",
-  "yarn.lock",
-  "pnpm-lock.yaml",
-  "bun.lock",
-  "bun.lockb",
-];
+const lockfiles = {
+  "package-lock.json": "npm",
+  "pnpm-lock.yaml": "pnpm",
+  "yarn.lock": "yarn",
+};
+const packageManagers = { pnpm: "pnpm@12.23.0", yarn: "yarn@1.22.22" };
+const unsupportedFiles = ["npm-shrinkwrap.json", "bun.lock", "bun.lockb"];
 export function normalizeUpgradePath(path) {
   if (
     typeof path !== "string" ||
@@ -281,17 +281,15 @@ function validateApp({ appPath, policy }) {
   return normalizeUpgradePath(appPath);
 }
 
-async function createScratch({ shared }) {
+async function createScratch() {
   const scratch = await realpath(await mkdtemp(join(tmpdir(), "next-upgrade-")));
   const privateRoot = join(scratch, "private");
   await mkdir(privateRoot, { mode: 0o700 });
-  if (shared) {
-    await sudo({
-      args: ["chgrp", agentUser, scratch],
-      description: "Sharing the scratch directory",
-    });
-    await chmod(scratch, 0o710);
-  }
+  await sudo({
+    args: ["chgrp", agentUser, scratch],
+    description: "Sharing the scratch directory",
+  });
+  await chmod(scratch, 0o710);
 
   return { scratch, privateRoot };
 }
@@ -309,31 +307,103 @@ async function checkUpgradeAt({
   stage.name = "setup";
   const baseRoot = join(privateRoot, "base");
   await checkout({ source: root, root: baseRoot, baseSha });
-  const lockfile = await statIfExists(join(baseRoot, path, "package-lock.json"));
-  if (!lockfile || !lockfile.isFile()) {
+  for (const file of unsupportedFiles) {
+    if (await statIfExists(join(baseRoot, path, file))) {
+      throw new Error(`Scheduled upgrades do not support ${file} yet.`);
+    }
+  }
+
+  const pnpmWorkspace = join(baseRoot, path, "pnpm-workspace.yaml");
+  if (
+    (await statIfExists(pnpmWorkspace)) &&
+    /^packages\s*:/mu.test(await readFile(pnpmWorkspace, "utf8"))
+  ) {
+    throw new Error("Scheduled upgrades do not support pnpm workspaces yet.");
+  }
+
+  const found = [];
+  for (const file of Object.keys(lockfiles)) {
+    const info = await statIfExists(join(baseRoot, path, file));
+    if (info && info.isFile()) {
+      found.push(file);
+    }
+  }
+
+  if (found.length !== 1) {
     throw new Error(
-      "Scheduled upgrades need a committed package-lock.json next to the app package.json on the default branch.",
+      "Scheduled upgrades need exactly one committed package-lock.json, pnpm-lock.yaml, or yarn.lock next to the app package.json on the default branch.",
     );
   }
 
-  for (const lockfile of otherLockfiles) {
-    if (await statIfExists(join(baseRoot, path, lockfile))) {
-      throw new Error(
-        `Scheduled upgrades need package-lock.json as the only lockfile, and the app also has ${lockfile}.`,
-      );
-    }
+  const manager = lockfiles[found[0]];
+  if (
+    manager === "yarn" &&
+    (await readFile(join(baseRoot, path, "yarn.lock"), "utf8")).includes("\n__metadata:")
+  ) {
+    throw new Error(
+      "Scheduled upgrades support Yarn 1, and the app uses a Yarn 2 or later lockfile.",
+    );
   }
 
   const id = candidateKey({ path, policy });
   const candidateRoot = join(scratch, id);
   const appDirectory = join(candidateRoot, path);
   await checkout({ source: root, root: candidateRoot, baseSha });
-  await run({
-    file: "npm",
-    args: ["ci", `--git=${systemCommand("git")}`, "--ignore-scripts", "--no-audit", "--no-fund"],
-    cwd: appDirectory,
-    description: "Dependency install",
-  });
+  const installArgs = {
+    npm: ["ci", `--git=${systemCommand("git")}`, "--ignore-scripts", "--no-audit", "--no-fund"],
+    pnpm: ["install", "--frozen-lockfile", "--ignore-scripts", "--ignore-pnpmfile"],
+    yarn: ["install", "--frozen-lockfile", "--ignore-scripts", "--non-interactive"],
+  };
+  if (Object.hasOwn(packageManagers, manager)) {
+    await run({
+      file: "npm",
+      args: [
+        "install",
+        "--global",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        packageManagers[manager],
+      ],
+      cwd: privateRoot,
+      description: `Installing ${manager}`,
+    });
+  }
+
+  const installHome = join(scratch, `${id}-install-home`);
+  await mkdir(installHome);
+  for (const path of [candidateRoot, installHome]) {
+    await sudo({
+      args: ["chown", "-R", `${agentUser}:${process.getgid()}`, path],
+      description: "Handing the checkout to the dependency install",
+    });
+  }
+
+  try {
+    await runAsAgentUser({
+      file: manager,
+      args: installArgs[manager],
+      cwd: appDirectory,
+      env: {
+        ...commandEnv(),
+        PATH: `${dirname(process.execPath)}:${systemPath}`,
+        HOME: installHome,
+        TMPDIR: installHome,
+        XDG_CONFIG_HOME: join(installHome, ".config"),
+        YARN_IGNORE_PATH: "1",
+      },
+      description: "Dependency install",
+    });
+  } finally {
+    for (const path of [candidateRoot, installHome]) {
+      await sudo({
+        args: ["chown", "-R", `${process.getuid()}:${process.getgid()}`, path],
+        description: "Reclaiming the checkout from the dependency install",
+      });
+    }
+  }
+
+  await rm(installHome, { recursive: true, force: true });
   const installedStatus = await git({ cwd: candidateRoot, args: ["status", "--porcelain", "-z"] });
 
   const { stdout: versionOutput } = await run({
@@ -397,7 +467,7 @@ function settledStatus({ handoff, path }) {
 async function checkUpgrade({ root, appPath, policy, cliPath }) {
   const path = validateApp({ appPath, policy });
   const baseSha = (await git({ cwd: root, args: ["rev-parse", "HEAD"] })).toString().trim();
-  const { scratch, privateRoot } = await createScratch({ shared: false });
+  const { scratch, privateRoot } = await createScratch();
   const stage = { name: "setup" };
   try {
     const { handoff } = await checkUpgradeAt({
@@ -441,7 +511,7 @@ async function runUpgrade({
   const path = validateApp({ appPath, policy });
   const baseSha = (await git({ cwd: root, args: ["rev-parse", "HEAD"] })).toString().trim();
   const index = { baseSha };
-  const { scratch, privateRoot } = await createScratch({ shared: true });
+  const { scratch, privateRoot } = await createScratch();
   const stage = { name: "setup" };
   try {
     await mkdir(artifactDirectory, { recursive: true });
@@ -489,23 +559,29 @@ async function runUpgrade({
 
     await copyTree({ source: candidateRoot, destination: snapshotRoot });
     const patch = await candidatePatch({ root: snapshotRoot, baseRoot, baseSha, credential });
-    const lockfile = parseJson({
+    const manifest = parseJson({
       value: (
         await git({
           cwd: snapshotRoot,
-          args: ["cat-file", "blob", `:${posix.join(path, "package-lock.json")}`],
+          args: ["cat-file", "blob", `:${posix.join(path, "package.json")}`],
         })
       ).toString("utf8"),
-      description: "candidate package-lock.json",
+      description: "candidate package.json",
     });
-    const packages = lockfile !== null && typeof lockfile === "object" ? lockfile.packages : null;
-    const lockedNext =
-      packages !== null && typeof packages === "object" ? packages["node_modules/next"] : null;
-    const lockedVersion =
-      lockedNext !== null && typeof lockedNext === "object" ? lockedNext.version : undefined;
-    if (lockedVersion !== handoff.targetVersion) {
+    const declared = ["dependencies", "devDependencies"]
+      .map((field) =>
+        manifest !== null && typeof manifest === "object" && typeof manifest[field] === "object"
+          ? Object(manifest[field]).next
+          : undefined,
+      )
+      .find((specifier) => specifier !== undefined);
+    if (
+      typeof declared !== "string" ||
+      semver.validRange(declared) === null ||
+      semver.minVersion(declared).version !== handoff.targetVersion
+    ) {
       throw new Error(
-        `The candidate locks next to ${lockedVersion} instead of ${handoff.targetVersion}.`,
+        `The candidate package.json requires next ${declared} instead of ${handoff.targetVersion}.`,
       );
     }
 

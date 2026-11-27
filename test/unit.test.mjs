@@ -193,7 +193,7 @@ test("pullRequestBody describes a root app minor upgrade", () => {
     lines.includes("- Release notes: https://github.com/vercel/next.js/releases/tag/v15.1.9"),
   );
   assert.doesNotMatch(body, /Upgrade guide/u);
-  assert.match(body, /package-lock\.json locks next to 15\.1\.9/u);
+  assert.match(body, /package\.json requires next 15\.1\.9/u);
   assert.equal(lines.at(-1), `Prepared by [this workflow run](${runUrl}).`);
 });
 

@@ -1,15 +1,21 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, before, describe, test } from "node:test";
+import { after, before, test } from "node:test";
 
-import { candidateKey } from "../scripts/upgrade.mjs";
-import { createRepository, git, scriptsDirectory, tempDirectory } from "./helpers.mjs";
+import { candidateKey } from "../../scripts/upgrade.mjs";
+import { createRepository, git, scriptsDirectory, tempDirectory } from "../helpers.mjs";
+import { describeStage } from "./utils.mjs";
+
+// The stage installs the app's dependencies as the agent user, so these tests need the machine
+// prepared like .github/workflows/e2e-test.yml.
 
 const upgradeScript = join(scriptsDirectory, "upgrade.mjs");
 const sentinel = "check-upgrade-sentinel";
+const oneLockfile =
+  /need exactly one committed package-lock\.json, pnpm-lock\.yaml, or yarn\.lock/u;
 const readyHandoff = JSON.stringify({
   status: "ready",
   installedVersion: "15.5.0",
@@ -96,6 +102,8 @@ function parseOutput(contents) {
 
 async function checkUpgrade({ t, root, appPath, policy, cli }) {
   const scratchTmp = await tempDirectory({ t, prefix: "next-upgrade-test-tmp-" });
+  // The agent user installs the dependencies in the scratch under TMPDIR, so it must traverse it.
+  await chmod(scratchTmp, 0o755);
   const files = await tempDirectory({ t, prefix: "next-upgrade-test-files-" });
   const cliDirectory = await tempDirectory({ t, prefix: "next-upgrade-test-cli-" });
   const { script, record } = await fakeCli({ directory: cliDirectory, ...cli });
@@ -136,7 +144,7 @@ async function checkUpgrade({ t, root, appPath, policy, cli }) {
   };
 }
 
-describe("check-upgrade stage at the repository root", () => {
+describeStage("check-upgrade stage at the repository root", () => {
   let root;
   let baseSha;
   before(async () => {
@@ -301,7 +309,7 @@ describe("check-upgrade stage at the repository root", () => {
   });
 });
 
-describe("check-upgrade stage in a nested app", () => {
+describeStage("check-upgrade stage in a nested app", () => {
   let root;
   let baseSha;
   before(async () => {
@@ -327,27 +335,42 @@ describe("check-upgrade stage in a nested app", () => {
     assert.equal(upgrade.env.__NEXT_UPGRADE_EXPECTED_CLI_VERSION, "15.5.0");
   });
 
-  test("fails when the app has no package-lock.json", async (t) => {
+  test("fails when the app has no lockfile", async (t) => {
     const result = await checkUpgrade({ t, root, appPath: ".", cli: { handoff: readyHandoff } });
     assert.equal(result.status, 1);
     assert.equal(result.output.status, "failed");
-    assert.match(result.stderr, /package-lock\.json/u);
+    assert.match(result.stderr, oneLockfile);
     assert.deepEqual(result.calls, []);
   });
 });
 
-describe("check-upgrade stage with another lockfile", () => {
-  for (const lockfile of ["yarn.lock", "pnpm-lock.yaml"]) {
-    test(`fails when the app also has ${lockfile}`, async (t) => {
+describeStage("check-upgrade stage with an unsupported setup", () => {
+  const cases = [
+    { name: "a second lockfile", files: { "yarn.lock": "\n" }, error: oneLockfile },
+    {
+      name: "a Yarn 2 lockfile",
+      files: { "package-lock.json": null, "yarn.lock": "\n__metadata:\n  version: 8\n" },
+      error: /support Yarn 1, and the app uses a Yarn 2 or later lockfile/u,
+    },
+    {
+      name: "a pnpm workspace",
+      files: { "pnpm-workspace.yaml": "packages:\n  - apps/*\n" },
+      error: /do not support pnpm workspaces yet/u,
+    },
+    { name: "bun.lock", files: { "bun.lock": "{}\n" }, error: /do not support bun\.lock yet/u },
+  ];
+  for (const { name, files, error } of cases) {
+    test(`fails with ${name}`, async (t) => {
       const directory = await tempDirectory({ t, prefix: "next-upgrade-test-consumer-" });
-      await createRepository({ directory, files: { ...appFiles("."), [lockfile]: "\n" } });
+      const app = { ...appFiles("."), ...files };
+      await createRepository({
+        directory,
+        files: Object.fromEntries(Object.entries(app).filter(([, contents]) => contents !== null)),
+      });
       const result = await checkUpgrade({ t, root: directory, cli: { handoff: readyHandoff } });
       assert.equal(result.status, 1);
       assert.equal(result.output.status, "failed");
-      assert.match(
-        result.stderr,
-        new RegExp(`the app also has ${lockfile.replace(".", "\\.")}`, "u"),
-      );
+      assert.match(result.stderr, error);
       assert.deepEqual(result.calls, []);
     });
   }
