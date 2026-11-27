@@ -1,10 +1,15 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { test } from "node:test";
 
+import { agentUser, stopAgent } from "../../../scripts/run-agent.mjs";
 import {
+  agentProcesses,
   assertFailed,
   assertModelRequests,
   assertPrepared,
   describeE2E,
+  exec,
   upgradeTestSetup,
 } from "../utils.mjs";
 
@@ -41,6 +46,36 @@ const scenarios = [
 
 describeE2E("single npm app", () => {
   const { upgrade } = upgradeTestSetup({ files: import.meta.dirname });
+
+  // Inside the PID namespace the kernel reaps leftovers when the agent exits, so stopAgent only
+  // has work to do after a timeout. Start an agent process outside any namespace instead.
+  test("stopAgent kills every agent process", { timeout: 30_000 }, async (t) => {
+    // A failed stopAgent must not leave the sleep behind for the scenarios below.
+    t.after(async () => {
+      try {
+        await exec("sudo", ["-n", "pkill", "-KILL", "-u", agentUser]);
+      } catch (error) {
+        // pkill exits 1 without output when stopAgent already left nothing to kill.
+        if (error.code !== 1 || error.stderr !== "") {
+          throw error;
+        }
+      }
+    });
+    const child = spawn("sudo", ["-n", "-u", agentUser, "/bin/sleep", "infinity"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    for (let attempt = 0; attempt < 40 && (await agentProcesses()) === ""; attempt += 1) {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 250);
+      });
+    }
+
+    assert.match(await agentProcesses(), /sleep infinity/u);
+    await stopAgent();
+    assert.equal(await agentProcesses(), "");
+  });
 
   for (const scenario of scenarios) {
     test(`${scenario.name} agent`, { timeout: 60_000 }, async (t) => {

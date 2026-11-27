@@ -230,15 +230,23 @@ export async function stopAgent() {
   let killError = null;
   try {
     await sudo({
-      args: ["-u", agentUser, systemCommand("kill"), "-KILL", "-1"],
+      args: ["-u", agentUser, systemCommand("pkill"), "-KILL", "-u", agentUser],
       description: "Stopping agent processes",
     });
   } catch (error) {
-    killError = error;
+    // pkill exits 1 without output when the processes exited before it ran, while sudo -n
+    // also exits 1 for its own failures but says why on stderr.
+    if (error.cause.code !== 1 || error.cause.stderr.length > 0) {
+      killError = error;
+    }
   }
 
   for (let attempt = 0; attempt < 40; attempt += 1) {
     if (!(await agentProcessesRunning())) {
+      if (killError) {
+        console.error(killError);
+      }
+
       return;
     }
 
