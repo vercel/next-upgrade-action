@@ -1,4 +1,4 @@
-name: Lint workflows
+name: Secure Action
 
 on:
   pull_request:
@@ -8,8 +8,8 @@ on:
 permissions: {}
 
 jobs:
-  lint-workflows:
-    name: Lint workflows
+  secure-action:
+    name: Secure Action
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
