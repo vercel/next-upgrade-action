@@ -222,7 +222,7 @@ async function agentProcessesRunning() {
   }
 }
 
-async function stopAgent() {
+export async function stopAgent() {
   if (!(await agentProcessesRunning())) {
     return;
   }
