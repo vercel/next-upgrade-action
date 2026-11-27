@@ -1,3 +1,3 @@
 - Avoid writing comments unless very complicated to understand. Comment only to explain why, never what.
 - Avoid extracting as functions and prefer inlining. Extract a function only for multi-line logic with more than one caller.
-- Never swallow errors.
+- Never swallow errors. Throw or console error at minimum.
