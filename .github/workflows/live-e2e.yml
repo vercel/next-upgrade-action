@@ -1,0 +1,46 @@
+name: Live end-to-end
+
+# Runs the reusable workflow for real in a fixture consumer repository with each hosted agent.
+# Configure the repository variables NEXT_UPGRADE_E2E_FIXTURE (owner/name) and
+# NEXT_UPGRADE_E2E_NEXT_VERSION, optionally NEXT_UPGRADE_E2E_APP_PATH, and the secret
+# NEXT_UPGRADE_E2E_TOKEN; see test/live/run.sh for what the fixture needs.
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-e2e
+  cancel-in-progress: false
+
+jobs:
+  live:
+    name: Live run (${{ matrix.agent }})
+    if: ${{ vars.NEXT_UPGRADE_E2E_FIXTURE != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      # Every agent upgrades the same fixture app, so the runs take turns.
+      max-parallel: 1
+      matrix:
+        agent: [claude, codex]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Run the fixture upgrade
+        env:
+          GH_TOKEN: ${{ secrets.NEXT_UPGRADE_E2E_TOKEN }}
+          FIXTURE: ${{ vars.NEXT_UPGRADE_E2E_FIXTURE }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          NEXT_VERSION: ${{ vars.NEXT_UPGRADE_E2E_NEXT_VERSION }}
+          APP_PATH: ${{ vars.NEXT_UPGRADE_E2E_APP_PATH || '.' }}
+          POLICY: latest
+          AGENT: ${{ matrix.agent }}
+        run: bash test/live/run.sh
