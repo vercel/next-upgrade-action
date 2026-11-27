@@ -13,9 +13,12 @@ import { tempDirectory } from "./utils.mjs";
 
 const unreachableOrigin = "https://127.0.0.1:1";
 
-async function startProxy({ t, agent, origin }) {
+async function startProxy({ t, agent, auth, origin }) {
   const proxy = await startAgentProxy({
-    provider: { ...providers[agent], origin: origin === undefined ? unreachableOrigin : origin },
+    provider: {
+      ...providers[auth ?? "api-key"][agent],
+      origin: origin === undefined ? unreachableOrigin : origin,
+    },
     credential: "real-credential",
   });
   t.after(() => proxy.close());
@@ -314,7 +317,7 @@ describe("startAgentProxy", () => {
 
   test("close resolves and stops accepting connections", async () => {
     const proxy = await startAgentProxy({
-      provider: { ...providers.codex, origin: unreachableOrigin },
+      provider: { ...providers["api-key"].codex, origin: unreachableOrigin },
       credential: "real-credential",
     });
     assert.equal(await proxy.close(), undefined);
@@ -377,6 +380,64 @@ describe("startAgentProxy", () => {
         assert.ok(!JSON.stringify(seen.headers).includes(claude.token));
         assert.ok(!JSON.stringify(seen.headers).includes(new URL(codex.origin).host));
         assert.ok(!JSON.stringify(seen.headers).includes(new URL(claude.origin).host));
+      }
+    },
+  );
+
+  test(
+    "AI Gateway requests stay on the agent's compatibility path and carry the key as a bearer token",
+    { skip: hasOpenssl() ? false : "openssl is not installed" },
+    async (t) => {
+      const upstream = await startUpstream({ t });
+      const codex = await startProxy({
+        t,
+        agent: "codex",
+        auth: "ai-gateway",
+        origin: upstream.origin,
+      });
+      const claude = await startProxy({
+        t,
+        agent: "claude",
+        auth: "ai-gateway",
+        origin: upstream.origin,
+      });
+      const cases = [
+        { proxy: codex, method: "POST", path: "/codex/v1/responses", status: 201 },
+        { proxy: codex, method: "GET", path: "/codex/v1/models", status: 201 },
+        { proxy: codex, method: "POST", path: "/v1/responses", status: 403 },
+        { proxy: claude, method: "POST", path: "/claude-code/v1/messages", status: 201 },
+        {
+          proxy: claude,
+          method: "POST",
+          path: "/claude-code/v1/messages/count_tokens",
+          status: 201,
+        },
+        { proxy: claude, method: "POST", path: "/v1/messages", status: 403 },
+        { proxy: claude, method: "GET", path: "/v1/credits", status: 403 },
+      ];
+      for (const { proxy, method, path, status } of cases) {
+        const response = await send({
+          proxy,
+          method,
+          path,
+          headers: { authorization: `Bearer ${proxy.token}` },
+          body: method === "POST" ? "{}" : undefined,
+        });
+        assert.equal(response.status, status, `${method} ${path}`);
+      }
+
+      assert.deepEqual(
+        upstream.seen.map(({ url }) => url),
+        [
+          "/codex/v1/responses",
+          "/codex/v1/models",
+          "/claude-code/v1/messages",
+          "/claude-code/v1/messages/count_tokens",
+        ],
+      );
+      for (const seen of upstream.seen) {
+        assert.equal(seen.headers.authorization, "Bearer real-credential");
+        assert.equal(seen.headers["x-api-key"], undefined);
       }
     },
   );

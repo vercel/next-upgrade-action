@@ -20,7 +20,7 @@ on:
         required: true
         type: string
       auth:
-        description: Kind of agent-credential; only api-key is supported for now
+        description: How the agent uses agent-credential
         default: api-key
         type: string
       telemetry-disabled:
