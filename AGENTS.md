@@ -1,0 +1,3 @@
+- Comment only to explain why, never what.
+- Extract a function only for multi-line logic with more than one caller.
+- Never swallow errors.
