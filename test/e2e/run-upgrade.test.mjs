@@ -2,13 +2,14 @@
 // reusable workflow's "Create the agent user" step plus the fake model API wiring in the e2e job
 // of .github/workflows/ci.yml, so it only runs there (NEXT_UPGRADE_E2E=1).
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { lookup } from "node:dns/promises";
 import { access, chmod, mkdir, mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, beforeEach, describe, test } from "node:test";
+import { promisify } from "node:util";
 
 import { agentUser, proxyTokenPattern, stopAgent } from "../../scripts/run-agent.mjs";
 import { candidateKey } from "../../scripts/upgrade.mjs";
@@ -23,6 +24,7 @@ import {
   writeFakeCli,
 } from "./helpers.mjs";
 
+const exec = promisify(execFile);
 const enabled = process.env.NEXT_UPGRADE_E2E === "1" && process.platform === "linux";
 const installedVersion = "15.5.0";
 const targetVersion = "15.5.1";
@@ -121,7 +123,9 @@ if (enabled) {
 
     // Inside the PID namespace the kernel reaps leftovers when the agent exits, so stopAgent only
     // has work to do after a timeout. Start an agent process outside any namespace instead.
-    test("stopAgent kills every agent process", { timeout: 60_000 }, async () => {
+    test("stopAgent kills every agent process", { timeout: 60_000 }, async (t) => {
+      // A failed stopAgent must not leave the sleep behind for the scenarios below.
+      t.after(() => exec("sudo", ["-n", "pkill", "-KILL", "-u", agentUser]).catch(() => null));
       const child = spawn("sudo", ["-n", "-u", agentUser, "/bin/sleep", "600"], {
         detached: true,
         stdio: "ignore",
