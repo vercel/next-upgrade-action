@@ -68,7 +68,12 @@ export async function run({
     }
 
     const timedOut = error.killed || Date.now() - started >= limit;
-    failure = new Error(`${description} ${timedOut ? "timed out" : "failed"}.`, { cause: error });
+    // The exec error's message, cmd, and spawnargs repeat the arguments, which can carry the
+    // agent's proxy token, so only the exit details are kept for the logs.
+    const { code, signal, killed } = error;
+    failure = new Error(`${description} ${timedOut ? "timed out" : "failed"}.`, {
+      cause: { code, signal, killed },
+    });
   }
 
   clearTimeout(timer);

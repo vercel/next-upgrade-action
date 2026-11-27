@@ -187,6 +187,11 @@ async function fakeAgent() {
       break;
     }
 
+    case "crash":
+      // Exits non-zero so the upgrade script logs the failed agent command.
+      process.exit(7);
+      break;
+
     default:
       break;
   }
