@@ -27,7 +27,7 @@ import { agentUser, proxyTokenPattern } from "../../scripts/run-agent.mjs";
 import { candidateKey } from "../../scripts/upgrade.mjs";
 import { createRepository, git, scriptsDirectory, tempDirectory } from "../unit/utils.mjs";
 
-const exec = promisify(execFile);
+export const exec = promisify(execFile);
 const installedVersion = "15.5.0";
 const targetVersion = "15.5.1";
 const enabled = process.env.NEXT_UPGRADE_E2E === "1" && process.platform === "linux";
@@ -217,7 +217,7 @@ async function snapshotTree({ directory }) {
   return entries;
 }
 
-async function agentProcesses() {
+export async function agentProcesses() {
   try {
     const { stdout } = await exec("pgrep", ["-a", "-u", agentUser]);
     return stdout.trim();
