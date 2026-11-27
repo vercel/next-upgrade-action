@@ -200,18 +200,21 @@ jobs:
         run: |
           set -euo pipefail
           case "$NEXT_UPGRADE_AGENT" in
-            codex)
-              npm install --global --ignore-scripts @openai/codex@0.161.0
-              ;;
-            claude)
-              npm install --global --ignore-scripts @anthropic-ai/claude-code@2.1.293
-              node "$(npm root --global)/@anthropic-ai/claude-code/install.cjs"
-              ;;
+            codex | claude) ;;
             *)
               echo 'Use codex or claude for agent.' >&2
               exit 1
               ;;
           esac
+          prefix="$(npm config get prefix)"
+          agent_dir="$prefix/lib/next-upgrade-agent"
+          mkdir -p "$agent_dir"
+          cp "action/agents/$NEXT_UPGRADE_AGENT/package.json" "action/agents/$NEXT_UPGRADE_AGENT/package-lock.json" "$agent_dir/"
+          npm ci --prefix "$agent_dir" --ignore-scripts --no-audit --no-fund
+          if [ "$NEXT_UPGRADE_AGENT" = claude ]; then
+            node "$agent_dir/node_modules/@anthropic-ai/claude-code/install.cjs"
+          fi
+          ln -s "$agent_dir/node_modules/.bin/$NEXT_UPGRADE_AGENT" "$prefix/bin/$NEXT_UPGRADE_AGENT"
       - name: Allow the Codex sandbox
         if: ${{ inputs.agent == 'codex' }}
         run: |
