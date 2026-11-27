@@ -52,7 +52,7 @@ export async function write({ directory, file, contents }) {
   await writeFile(target, contents);
 }
 
-export const baseFiles = {
+const baseFiles = {
   "package.json": '{ "name": "app", "dependencies": { "next": "15.0.0" } }\n',
   "package-lock.json": '{ "name": "app", "lockfileVersion": 3, "packages": {} }\n',
   "README.md": "# App\n",
