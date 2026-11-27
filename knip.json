@@ -6,7 +6,7 @@
     "scripts/pull-request.mjs",
     "test/**/*.test.mjs"
   ],
-  "project": ["scripts/**/*.mjs", "test/**/*.mjs"],
+  "project": ["scripts/**/*.mjs", "test/**/*.mjs", "!test/e2e/*/next.config.mjs"],
   "ignoreBinaries": ["openssl"],
   "node": false
 }

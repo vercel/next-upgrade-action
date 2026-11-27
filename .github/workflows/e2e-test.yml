@@ -1,0 +1,49 @@
+name: E2E test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: E2E test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - run: npm ci
+      # Same as the "Create the agent user" step of next-upgrade.yml.
+      - name: Create the agent user
+        run: |
+          set -euo pipefail
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin next-upgrade-agent
+          sudo chmod -R go-w /opt/hostedtoolcache "$(npm config get prefix)"
+          for dir in "$(dirname "$(command -v node)")" /usr/bin /bin; do
+            if sudo -n -u next-upgrade-agent test -w "$dir"; then
+              echo "The agent user can write to $dir on its PATH." >&2
+              exit 1
+            fi
+          done
+      # The test serves a fake https://api.anthropic.com on 127.0.0.1:443 with a self-signed
+      # certificate it passes to the upgrade script through NODE_EXTRA_CA_CERTS. Lowering the
+      # unprivileged port range keeps node free of file capabilities, which would make it
+      # ignore NODE_EXTRA_CA_CERTS.
+      - name: Route the model API to the fake server
+        run: |
+          set -euo pipefail
+          echo "127.0.0.1 api.anthropic.com" | sudo tee -a /etc/hosts
+          sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443
+      - name: Run the end-to-end test
+        env:
+          NEXT_UPGRADE_E2E: "1"
+        run: npm run test:e2e
