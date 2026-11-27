@@ -31,7 +31,7 @@ const lockfiles = {
   "yarn.lock": "yarn",
 };
 const packageManagers = { pnpm: "pnpm@12.23.0", yarn: "yarn@1.22.22" };
-const unsupportedFiles = ["npm-shrinkwrap.json", "bun.lock", "bun.lockb", "pnpm-workspace.yaml"];
+const unsupportedFiles = ["npm-shrinkwrap.json", "bun.lock", "bun.lockb"];
 export function normalizeUpgradePath(path) {
   if (
     typeof path !== "string" ||
@@ -311,6 +311,14 @@ async function checkUpgradeAt({
     if (await statIfExists(join(baseRoot, path, file))) {
       throw new Error(`Scheduled upgrades do not support ${file} yet.`);
     }
+  }
+
+  const pnpmWorkspace = join(baseRoot, path, "pnpm-workspace.yaml");
+  if (
+    (await statIfExists(pnpmWorkspace)) &&
+    /^packages\s*:/mu.test(await readFile(pnpmWorkspace, "utf8"))
+  ) {
+    throw new Error("Scheduled upgrades do not support pnpm workspaces yet.");
   }
 
   const found = [];
