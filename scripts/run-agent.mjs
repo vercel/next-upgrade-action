@@ -15,7 +15,7 @@ import { commandEnv, run, showOutput, sudo, systemCommand, systemPath } from "./
 
 const exec = promisify(execFile);
 
-const providers = {
+export const providers = {
   codex: {
     origin: "https://api.openai.com",
     name: "OpenAI",
@@ -102,7 +102,7 @@ async function readReply(path) {
   }
 }
 
-async function startAgentProxy({ provider, credential }) {
+export async function startAgentProxy({ provider, credential }) {
   const allowed = new Set(provider.endpoints);
   const token = `next-upgrade-${randomBytes(24).toString("hex")}`;
   const upstream = new URL(provider.origin);
