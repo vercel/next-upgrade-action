@@ -1,6 +1,7 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import * as core from "@actions/core";
 import { getOctokit } from "@actions/github";
@@ -9,7 +10,7 @@ import semver from "semver";
 import { commandEnv, run, systemCommand, systemPath } from "./process.mjs";
 import { candidateKey, normalizeUpgradePath } from "./upgrade.mjs";
 
-function gitAt({ cwd, alternates }) {
+export function gitAt({ cwd, alternates }) {
   const env = {
     ...commandEnv(),
     PATH: systemPath,
@@ -82,7 +83,7 @@ async function entries({ git, tree }) {
   );
 }
 
-async function applyPatch({ git, baseSha, patch }) {
+export async function applyPatch({ git, baseSha, patch }) {
   const base = await entries({ git, tree: baseSha });
   await git({ args: ["read-tree", baseSha] });
   await git({ args: ["apply", "--cached", "--binary", "--whitespace=nowarn", "-"], input: patch });
@@ -147,7 +148,7 @@ async function findOpenPullRequest({ github, repository, baseBranch, target }) {
   return { status: "existing_pull_request", url: pull.html_url };
 }
 
-function codeSpan(text) {
+export function codeSpan(text) {
   const visible = text.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "\uFFFD");
   const longest = Math.max(0, ...(visible.match(/`+/g) ?? []).map((run) => run.length));
   const fence = "`".repeat(longest + 1);
@@ -155,7 +156,7 @@ function codeSpan(text) {
   return `${fence}${padded}${fence}`;
 }
 
-function pullRequestBody({ target, runUrl }) {
+export function pullRequestBody({ target, runUrl }) {
   const { path: appPath, policy, fromVersion, targetVersion } = target;
   const lines = [
     `### Next.js ${fromVersion} → ${targetVersion}`,
@@ -395,7 +396,7 @@ async function openPullRequest({
   }
 }
 
-function html(text) {
+export function html(text) {
   return text
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
@@ -465,9 +466,11 @@ async function main(env) {
   await writeSummary({ appPath, ...result });
 }
 
-try {
-  await main(process.env);
-} catch (error) {
-  console.error(error);
-  core.setFailed(`Could not open the Next.js upgrade pull request: ${error.message}.`);
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    await main(process.env);
+  } catch (error) {
+    console.error(error);
+    core.setFailed(`Could not open the Next.js upgrade pull request: ${error.message}.`);
+  }
 }

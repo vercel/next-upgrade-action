@@ -2,6 +2,7 @@
   "name": "next-upgrade-action",
   "private": true,
   "scripts": {
+    "test": "node --test \"test/unit/*.test.mjs\"",
     "lint": "eslint . && knip",
     "format": "oxfmt",
     "format:check": "oxfmt --check"

@@ -58,7 +58,15 @@ export function candidateKey({ path, policy }) {
 async function git({ cwd, args, input }) {
   const { stdout } = await run({
     file: systemCommand("git"),
-    args: ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args],
+    args: [
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "core.excludesFile=/dev/null",
+      ...args,
+    ],
     cwd,
     env: {
       ...commandEnv(),
@@ -83,7 +91,7 @@ async function checkout({ source, root, baseSha }) {
   await appendFile(join(root, ".git", "info", "exclude"), "\nnode_modules/\n.next/\n");
 }
 
-async function copyTree({ source, destination }) {
+export async function copyTree({ source, destination }) {
   for (const entry of await readdir(source)) {
     const from = join(source, entry);
     const to = join(destination, entry);
@@ -124,7 +132,7 @@ async function copyTree({ source, destination }) {
   }
 }
 
-async function candidatePatch({ root, baseRoot, baseSha, credential }) {
+export async function candidatePatch({ root, baseRoot, baseSha, credential }) {
   await git({ cwd: root, args: ["add", "--all"] });
   await git({
     cwd: root,
@@ -240,7 +248,7 @@ async function sameFile({ base, candidate }) {
   return baseBytes.equals(candidateBytes);
 }
 
-function readHandoff(contents) {
+export function readHandoff(contents) {
   const handoff = parseJson({ value: contents, description: "Next.js upgrade handoff" });
   if (handoff === null || typeof handoff !== "object") {
     throw new Error("Unsupported Next.js upgrade handoff.");
