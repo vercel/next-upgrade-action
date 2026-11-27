@@ -15,7 +15,7 @@ import { commandEnv, run, showOutput, sudo, systemCommand, systemPath } from "./
 
 const exec = promisify(execFile);
 
-const providers = {
+export const providers = {
   codex: {
     origin: "https://api.openai.com",
     name: "OpenAI",
@@ -102,7 +102,7 @@ async function readReply(path) {
   }
 }
 
-async function startAgentProxy({ provider, credential }) {
+export async function startAgentProxy({ provider, credential }) {
   const allowed = new Set(provider.endpoints);
   const token = `next-upgrade-${randomBytes(24).toString("hex")}`;
   const upstream = new URL(provider.origin);
@@ -222,7 +222,7 @@ async function agentProcessesRunning() {
   }
 }
 
-async function stopAgent() {
+export async function stopAgent() {
   if (!(await agentProcessesRunning())) {
     return;
   }
@@ -230,15 +230,23 @@ async function stopAgent() {
   let killError = null;
   try {
     await sudo({
-      args: ["-u", agentUser, systemCommand("kill"), "-KILL", "-1"],
+      args: ["-u", agentUser, systemCommand("pkill"), "-KILL", "-u", agentUser],
       description: "Stopping agent processes",
     });
   } catch (error) {
-    killError = error;
+    // pkill exits 1 without output when the processes exited before it ran, while sudo -n
+    // also exits 1 for its own failures but says why on stderr.
+    if (error.cause.code !== 1 || error.cause.stderr.length > 0) {
+      killError = error;
+    }
   }
 
   for (let attempt = 0; attempt < 40; attempt += 1) {
     if (!(await agentProcessesRunning())) {
+      if (killError) {
+        console.error(killError);
+      }
+
       return;
     }
 
@@ -250,6 +258,33 @@ async function stopAgent() {
   }
 
   throw new Error("Could not stop the agent processes.");
+}
+
+export function runAsAgentUser({ file, args, env, ...options }) {
+  return run({
+    ...options,
+    file: systemCommand("sudo"),
+    args: [
+      "-n",
+      systemCommand("unshare"),
+      "--pid",
+      "--fork",
+      "--mount-proc",
+      systemCommand("setpriv"),
+      `--reuid=${agentUser}`,
+      `--regid=${agentUser}`,
+      "--init-groups",
+      "--no-new-privs",
+      "--inh-caps=-all",
+      "--bounding-set=-all",
+      systemCommand("env"),
+      "-i",
+      ...Object.entries(env).map(([name, value]) => `${name}=${value}`),
+      file,
+      ...args,
+    ],
+    env: commandEnv(),
+  });
 }
 
 export async function runAgent({
@@ -351,33 +386,6 @@ exclude = ["NEXT_UPGRADE_PROXY_TOKEN"]
       });
     }
 
-    const envArgs = Object.entries(env).map(([name, value]) => `${name}=${value}`);
-    const runAsAgentUser = ({ file, args, ...options }) =>
-      run({
-        ...options,
-        file: systemCommand("sudo"),
-        args: [
-          "-n",
-          systemCommand("unshare"),
-          "--pid",
-          "--fork",
-          "--mount-proc",
-          systemCommand("setpriv"),
-          `--reuid=${agentUser}`,
-          `--regid=${agentUser}`,
-          "--init-groups",
-          "--no-new-privs",
-          "--inh-caps=-all",
-          "--bounding-set=-all",
-          systemCommand("env"),
-          "-i",
-          ...envArgs,
-          file,
-          ...args,
-        ],
-        env: commandEnv(),
-      });
-
     const modelArgs = model === undefined ? [] : ["--model", model];
     if (effort !== undefined) {
       modelArgs.push(
@@ -387,6 +395,7 @@ exclude = ["NEXT_UPGRADE_PROXY_TOKEN"]
 
     const instructions = `The checkout is ${JSON.stringify(root)}. Run the app commands from ${JSON.stringify(cwd)}.\n\n${prompt}\n\nWhen you finish, report the result. Set verified to true only after every required installation and app check passed. Otherwise set verified to false and explain the failure in summary.`;
     const agentOptions = {
+      env,
       cwd: home,
       timeout: agentTimeout,
       showOutputOnFailure: true,

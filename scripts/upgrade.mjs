@@ -11,27 +11,28 @@ import {
   readFile,
   readlink,
   realpath,
+  rename,
   rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, posix } from "node:path";
+import { dirname, join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import semver from "semver";
 
 import { commandEnv, run, sudo, systemCommand, systemPath } from "./process.mjs";
-import { agentUser, proxyTokenPattern, runAgent } from "./run-agent.mjs";
+import { agentUser, proxyTokenPattern, runAgent, runAsAgentUser, stopAgent } from "./run-agent.mjs";
 
 const policies = new Set(["security", "latest"]);
-const otherLockfiles = [
-  "npm-shrinkwrap.json",
-  "yarn.lock",
-  "pnpm-lock.yaml",
-  "bun.lock",
-  "bun.lockb",
-];
+const lockfiles = {
+  "package-lock.json": "npm",
+  "pnpm-lock.yaml": "pnpm",
+  "yarn.lock": "yarn",
+};
+const packageManagers = { pnpm: "pnpm@12.23.0", yarn: "yarn@1.22.22" };
+const unsupportedFiles = ["npm-shrinkwrap.json", "bun.lock", "bun.lockb"];
 export function normalizeUpgradePath(path) {
   if (
     typeof path !== "string" ||
@@ -57,7 +58,15 @@ export function candidateKey({ path, policy }) {
 async function git({ cwd, args, input }) {
   const { stdout } = await run({
     file: systemCommand("git"),
-    args: ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args],
+    args: [
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "core.excludesFile=/dev/null",
+      ...args,
+    ],
     cwd,
     env: {
       ...commandEnv(),
@@ -82,7 +91,7 @@ async function checkout({ source, root, baseSha }) {
   await appendFile(join(root, ".git", "info", "exclude"), "\nnode_modules/\n.next/\n");
 }
 
-async function copyTree({ source, destination }) {
+export async function copyTree({ source, destination }) {
   for (const entry of await readdir(source)) {
     const from = join(source, entry);
     const to = join(destination, entry);
@@ -123,7 +132,7 @@ async function copyTree({ source, destination }) {
   }
 }
 
-async function candidatePatch({ root, baseRoot, baseSha, credential }) {
+export async function candidatePatch({ root, baseRoot, baseSha, credential }) {
   await git({ cwd: root, args: ["add", "--all"] });
   await git({
     cwd: root,
@@ -239,7 +248,7 @@ async function sameFile({ base, candidate }) {
   return baseBytes.equals(candidateBytes);
 }
 
-function readHandoff(contents) {
+export function readHandoff(contents) {
   const handoff = parseJson({ value: contents, description: "Next.js upgrade handoff" });
   if (handoff === null || typeof handoff !== "object") {
     throw new Error("Unsupported Next.js upgrade handoff.");
@@ -281,17 +290,15 @@ function validateApp({ appPath, policy }) {
   return normalizeUpgradePath(appPath);
 }
 
-async function createScratch({ shared }) {
+async function createScratch() {
   const scratch = await realpath(await mkdtemp(join(tmpdir(), "next-upgrade-")));
   const privateRoot = join(scratch, "private");
   await mkdir(privateRoot, { mode: 0o700 });
-  if (shared) {
-    await sudo({
-      args: ["chgrp", agentUser, scratch],
-      description: "Sharing the scratch directory",
-    });
-    await chmod(scratch, 0o710);
-  }
+  await sudo({
+    args: ["chgrp", agentUser, scratch],
+    description: "Sharing the scratch directory",
+  });
+  await chmod(scratch, 0o710);
 
   return { scratch, privateRoot };
 }
@@ -309,31 +316,153 @@ async function checkUpgradeAt({
   stage.name = "setup";
   const baseRoot = join(privateRoot, "base");
   await checkout({ source: root, root: baseRoot, baseSha });
-  const lockfile = await statIfExists(join(baseRoot, path, "package-lock.json"));
-  if (!lockfile || !lockfile.isFile()) {
+  for (const file of unsupportedFiles) {
+    if (await statIfExists(join(baseRoot, path, file))) {
+      throw new Error(`Scheduled upgrades do not support ${file} yet.`);
+    }
+  }
+
+  // pnpm and Yarn look for a workspace root above the app and would install it as part of that
+  // workspace, so the directories above the app count too.
+  const directories = [path];
+  while (directories.at(-1) !== ".") {
+    directories.push(posix.dirname(directories.at(-1)));
+  }
+
+  for (const directory of directories) {
+    const pnpmWorkspace = join(baseRoot, directory, "pnpm-workspace.yaml");
+    if (
+      (await statIfExists(pnpmWorkspace)) &&
+      (directory !== path ||
+        /^(?:\{\s*)?["']?packages["']?\s*:/mu.test(
+          (await readFile(pnpmWorkspace, "utf8")).replace(/^\uFEFF/u, ""),
+        ))
+    ) {
+      throw new Error("Scheduled upgrades do not support pnpm workspaces yet.");
+    }
+
+    const manifest = join(baseRoot, directory, "package.json");
+    if (directory !== path && (await statIfExists(manifest))) {
+      const parsed = parseJson({
+        value: await readFile(manifest, "utf8"),
+        description: `${posix.join(directory, "package.json")}`,
+      });
+      if (parsed !== null && typeof parsed === "object" && Object.hasOwn(parsed, "workspaces")) {
+        throw new Error("Scheduled upgrades do not support apps inside a workspace yet.");
+      }
+    }
+  }
+
+  const found = [];
+  for (const file of Object.keys(lockfiles)) {
+    const info = await statIfExists(join(baseRoot, path, file));
+    if (info && info.isFile()) {
+      found.push(file);
+    }
+  }
+
+  if (found.length !== 1) {
     throw new Error(
-      "Scheduled upgrades need a committed package-lock.json next to the app package.json on the default branch.",
+      "Scheduled upgrades need exactly one committed package-lock.json, pnpm-lock.yaml, or yarn.lock next to the app package.json on the default branch.",
     );
   }
 
-  for (const lockfile of otherLockfiles) {
-    if (await statIfExists(join(baseRoot, path, lockfile))) {
-      throw new Error(
-        `Scheduled upgrades need package-lock.json as the only lockfile, and the app also has ${lockfile}.`,
-      );
-    }
+  const manager = lockfiles[found[0]];
+  if (
+    manager === "yarn" &&
+    (await readFile(join(baseRoot, path, "yarn.lock"), "utf8")).includes("\n__metadata:")
+  ) {
+    throw new Error(
+      "Scheduled upgrades support Yarn 1, and the app uses a Yarn 2 or later lockfile.",
+    );
   }
 
   const id = candidateKey({ path, policy });
   const candidateRoot = join(scratch, id);
   const appDirectory = join(candidateRoot, path);
   await checkout({ source: root, root: candidateRoot, baseSha });
-  await run({
-    file: "npm",
-    args: ["ci", `--git=${systemCommand("git")}`, "--ignore-scripts", "--no-audit", "--no-fund"],
-    cwd: appDirectory,
-    description: "Dependency install",
-  });
+  const installArgs = {
+    npm: ["ci", `--git=${systemCommand("git")}`, "--ignore-scripts", "--no-audit", "--no-fund"],
+    pnpm: ["install", "--frozen-lockfile", "--ignore-scripts", "--ignore-pnpmfile"],
+    yarn: ["install", "--frozen-lockfile", "--ignore-scripts", "--non-interactive"],
+  };
+  if (Object.hasOwn(packageManagers, manager)) {
+    await run({
+      file: "npm",
+      args: [
+        "install",
+        "--global",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+        packageManagers[manager],
+      ],
+      cwd: privateRoot,
+      description: `Installing ${manager}`,
+    });
+  }
+
+  const installHome = join(scratch, `${id}-install-home`);
+  await mkdir(installHome);
+  // The install can run dependency code as the agent user, which could plant git config such as a
+  // clean filter in .git for the runner's later git status to run, so .git waits outside its reach.
+  const gitDirectory = join(privateRoot, `${id}.git`);
+  await rename(join(candidateRoot, ".git"), gitDirectory);
+  for (const path of [candidateRoot, installHome]) {
+    await sudo({
+      args: ["chown", "-R", `${agentUser}:${process.getgid()}`, path],
+      description: "Handing the checkout to the dependency install",
+    });
+  }
+
+  let installError = null;
+  try {
+    await runAsAgentUser({
+      file: manager,
+      args: installArgs[manager],
+      cwd: appDirectory,
+      env: {
+        ...commandEnv(),
+        PATH: `${dirname(process.execPath)}:${systemPath}`,
+        HOME: installHome,
+        TMPDIR: installHome,
+        XDG_CONFIG_HOME: join(installHome, ".config"),
+        YARN_IGNORE_PATH: "1",
+      },
+      description: "Dependency install",
+      onTimeout: stopAgent,
+    });
+  } catch (error) {
+    installError = error;
+  }
+
+  try {
+    for (const path of [candidateRoot, installHome]) {
+      await sudo({
+        args: ["chown", "-R", `${process.getuid()}:${process.getgid()}`, path],
+        description: "Reclaiming the checkout from the dependency install",
+      });
+    }
+
+    await rm(join(candidateRoot, ".git"), { recursive: true, force: true });
+    await rename(gitDirectory, join(candidateRoot, ".git"));
+  } catch (reclaimError) {
+    if (installError) {
+      throw new AggregateError(
+        [installError, reclaimError],
+        `${installError.message} Reclaiming the checkout also failed: ${reclaimError.message}`,
+        { cause: reclaimError },
+      );
+    }
+
+    throw reclaimError;
+  }
+
+  if (installError) {
+    throw installError;
+  }
+
+  await rm(installHome, { recursive: true, force: true });
   const installedStatus = await git({ cwd: candidateRoot, args: ["status", "--porcelain", "-z"] });
 
   const { stdout: versionOutput } = await run({
@@ -381,7 +510,7 @@ async function checkUpgradeAt({
     }
   }
 
-  return { id, baseRoot, candidateRoot, appDirectory, guides, handoff };
+  return { id, baseRoot, candidateRoot, appDirectory, guides, handoff, lockfile: found[0] };
 }
 
 function settledStatus({ handoff, path }) {
@@ -397,7 +526,7 @@ function settledStatus({ handoff, path }) {
 async function checkUpgrade({ root, appPath, policy, cliPath }) {
   const path = validateApp({ appPath, policy });
   const baseSha = (await git({ cwd: root, args: ["rev-parse", "HEAD"] })).toString().trim();
-  const { scratch, privateRoot } = await createScratch({ shared: false });
+  const { scratch, privateRoot } = await createScratch();
   const stage = { name: "setup" };
   try {
     const { handoff } = await checkUpgradeAt({
@@ -441,20 +570,21 @@ async function runUpgrade({
   const path = validateApp({ appPath, policy });
   const baseSha = (await git({ cwd: root, args: ["rev-parse", "HEAD"] })).toString().trim();
   const index = { baseSha };
-  const { scratch, privateRoot } = await createScratch({ shared: true });
+  const { scratch, privateRoot } = await createScratch();
   const stage = { name: "setup" };
   try {
     await mkdir(artifactDirectory, { recursive: true });
-    const { id, baseRoot, candidateRoot, appDirectory, guides, handoff } = await checkUpgradeAt({
-      root,
-      path,
-      policy,
-      cliPath,
-      baseSha,
-      scratch,
-      privateRoot,
-      stage,
-    });
+    const { id, baseRoot, candidateRoot, appDirectory, guides, handoff, lockfile } =
+      await checkUpgradeAt({
+        root,
+        path,
+        policy,
+        cliPath,
+        baseSha,
+        scratch,
+        privateRoot,
+        stage,
+      });
     if (handoff.status !== "ready") {
       index.status = settledStatus({ handoff, path });
       return index;
@@ -489,24 +619,70 @@ async function runUpgrade({
 
     await copyTree({ source: candidateRoot, destination: snapshotRoot });
     const patch = await candidatePatch({ root: snapshotRoot, baseRoot, baseSha, credential });
-    const lockfile = parseJson({
-      value: (
-        await git({
-          cwd: snapshotRoot,
-          args: ["cat-file", "blob", `:${posix.join(path, "package-lock.json")}`],
-        })
-      ).toString("utf8"),
-      description: "candidate package-lock.json",
-    });
-    const packages = lockfile !== null && typeof lockfile === "object" ? lockfile.packages : null;
-    const lockedNext =
-      packages !== null && typeof packages === "object" ? packages["node_modules/next"] : null;
-    const lockedVersion =
-      lockedNext !== null && typeof lockedNext === "object" ? lockedNext.version : undefined;
-    if (lockedVersion !== handoff.targetVersion) {
-      throw new Error(
-        `The candidate locks next to ${lockedVersion} instead of ${handoff.targetVersion}.`,
-      );
+    const [manifestText, lockText] = await Promise.all(
+      ["package.json", lockfile].map(async (file) =>
+        (
+          await git({
+            cwd: snapshotRoot,
+            args: ["cat-file", "blob", `:${posix.join(path, file)}`],
+          })
+        ).toString("utf8"),
+      ),
+    );
+    const manifest = parseJson({ value: manifestText, description: "candidate package.json" });
+    const declared = ["dependencies", "devDependencies"]
+      .map((field) =>
+        manifest !== null && typeof manifest === "object" && typeof manifest[field] === "object"
+          ? Object(manifest[field]).next
+          : undefined,
+      )
+      .filter((specifier) => specifier !== undefined);
+    for (const specifier of declared.length === 0 ? [undefined] : declared) {
+      const minimum =
+        typeof specifier === "string" && semver.validRange(specifier) !== null
+          ? semver.minVersion(specifier)
+          : null;
+      if (minimum === null || minimum.version !== handoff.targetVersion) {
+        throw new Error(
+          `The candidate package.json requires next ${specifier} instead of ${handoff.targetVersion}.`,
+        );
+      }
+    }
+
+    let locked;
+    if (lockfile === "package-lock.json") {
+      const lock = parseJson({ value: lockText, description: "candidate package-lock.json" });
+      const packages = lock !== null && typeof lock === "object" ? Object(lock.packages) : {};
+      locked = Object(packages["node_modules/next"]).version;
+    } else if (lockfile === "pnpm-lock.yaml") {
+      const importer = /^ {2}\.:\n((?: {4}.*\n)*)/mu.exec(lockText);
+      const entry =
+        importer && /^ {6}next:\n {8}specifier: .*\n {8}version: ([^\s(]+)/mu.exec(importer[1]);
+      locked = entry ? entry[1] : undefined;
+    } else {
+      // A Yarn 1 entry starts with its comma-separated keys, such as "next@^15.5.0, next@15.5.1:".
+      const entry = lockText
+        .split("\n\n")
+        .map((block) => block.split("\n").filter((line) => line !== "" && !line.startsWith("#")))
+        .find(
+          (lines) =>
+            lines.length > 0 &&
+            lines[0]
+              .replace(/:$/u, "")
+              .split(",")
+              .some((key) =>
+                declared.some(
+                  (specifier) => key.trim().replace(/^"|"$/gu, "") === `next@${specifier}`,
+                ),
+              ),
+        );
+      const version =
+        entry && entry.map((line) => /^ {2}version "([^"]+)"$/u.exec(line)).find(Boolean);
+      locked = version ? version[1] : undefined;
+    }
+
+    if (locked !== handoff.targetVersion) {
+      throw new Error(`The candidate ${lockfile} does not lock next to ${handoff.targetVersion}.`);
     }
 
     await writeFile(join(artifactDirectory, `${id}.patch`), patch);
