@@ -58,7 +58,15 @@ export function candidateKey({ path, policy }) {
 async function git({ cwd, args, input }) {
   const { stdout } = await run({
     file: systemCommand("git"),
-    args: ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args],
+    args: [
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "core.excludesFile=/dev/null",
+      ...args,
+    ],
     cwd,
     env: {
       ...commandEnv(),
