@@ -42,6 +42,8 @@ const scenarios = [
   },
   { name: "nothing", status: "failed", error: /did not change any files/u },
   { name: "unverified", status: "failed", error: /Claude did not confirm app verification/u },
+  // The failed agent command is logged, and its arguments carry the proxy token.
+  { name: "crash", status: "failed", error: /Claude upgrade and verification failed/u },
 ];
 
 describeE2E("single npm app", () => {
