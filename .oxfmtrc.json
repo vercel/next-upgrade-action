@@ -3,5 +3,5 @@
   "semi": true,
   "singleQuote": false,
   "sortImports": true,
-  "ignorePatterns": ["package-lock.json"]
+  "ignorePatterns": ["package-lock.json", "templates/"]
 }
