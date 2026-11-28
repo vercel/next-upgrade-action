@@ -16,25 +16,63 @@ import { commandEnv, run, showOutput, sudo, systemCommand, systemPath } from "./
 const exec = promisify(execFile);
 
 export const providers = {
-  codex: {
-    origin: "https://api.openai.com",
-    name: "OpenAI",
-    endpoints: ["POST /v1/responses", "POST /v1/responses/compact", "GET /v1/models"],
-    efforts: ["minimal", "low", "medium", "high", "xhigh"],
-    authorize({ headers, credential }) {
-      headers.authorization = `Bearer ${credential}`;
+  "api-key": {
+    codex: {
+      origin: "https://api.openai.com",
+      name: "OpenAI",
+      basePath: "",
+      checkPath: "/v1/models",
+      endpoints: ["POST /v1/responses", "POST /v1/responses/compact", "GET /v1/models"],
+      authorize({ headers, credential }) {
+        headers.authorization = `Bearer ${credential}`;
+      },
+    },
+    claude: {
+      origin: "https://api.anthropic.com",
+      name: "Anthropic",
+      basePath: "",
+      checkPath: "/v1/models",
+      endpoints: ["POST /v1/messages", "POST /v1/messages/count_tokens", "GET /v1/models"],
+      authorize({ headers, credential }) {
+        headers["x-api-key"] = credential;
+        headers["anthropic-version"] ??= "2023-06-01";
+      },
     },
   },
-  claude: {
-    origin: "https://api.anthropic.com",
-    name: "Anthropic",
-    endpoints: ["POST /v1/messages", "POST /v1/messages/count_tokens", "GET /v1/models"],
-    efforts: ["low", "medium", "high", "xhigh", "max"],
-    authorize({ headers, credential }) {
-      headers["x-api-key"] = credential;
-      headers["anthropic-version"] ??= "2023-06-01";
+  "ai-gateway": {
+    codex: {
+      origin: "https://ai-gateway.vercel.sh",
+      name: "Vercel AI Gateway",
+      basePath: "/codex",
+      checkPath: "/v1/credits",
+      endpoints: [
+        "POST /codex/v1/responses",
+        "POST /codex/v1/responses/compact",
+        "GET /codex/v1/models",
+      ],
+      authorize({ headers, credential }) {
+        headers.authorization = `Bearer ${credential}`;
+      },
+    },
+    claude: {
+      origin: "https://ai-gateway.vercel.sh",
+      name: "Vercel AI Gateway",
+      basePath: "/claude-code",
+      checkPath: "/v1/credits",
+      endpoints: [
+        "POST /claude-code/v1/messages",
+        "POST /claude-code/v1/messages/count_tokens",
+        "GET /claude-code/v1/models",
+      ],
+      authorize({ headers, credential }) {
+        headers.authorization = `Bearer ${credential}`;
+      },
     },
   },
+};
+const efforts = {
+  codex: ["minimal", "low", "medium", "high", "xhigh"],
+  claude: ["low", "medium", "high", "xhigh", "max"],
 };
 
 export const agentUser = "next-upgrade-agent";
@@ -55,7 +93,7 @@ const commandTimeout = String(30 * 60_000);
 async function checkApiKey({ provider, credential }) {
   const headers = {};
   provider.authorize({ headers, credential });
-  const response = await fetch(new URL("/v1/models", provider.origin), { headers }).catch(
+  const response = await fetch(new URL(provider.checkPath, provider.origin), { headers }).catch(
     (error) => {
       throw new Error(`Could not reach ${provider.name} to check the API key.`, { cause: error });
     },
@@ -298,16 +336,16 @@ export async function runAgent({
   cwd,
   prompt,
 }) {
-  if (!Object.hasOwn(providers, agent)) {
+  if (!Object.hasOwn(efforts, agent)) {
     throw new Error("Use codex or claude for the agent.");
   }
 
-  if (auth !== "api-key") {
-    throw new Error("Only api-key auth is supported for now.");
+  if (!Object.hasOwn(providers, auth)) {
+    throw new Error("Use api-key or ai-gateway for the auth.");
   }
 
-  if (effort !== undefined && !providers[agent].efforts.includes(effort)) {
-    throw new Error(`Use one of ${providers[agent].efforts.join(", ")} for the ${agent} effort.`);
+  if (effort !== undefined && !efforts[agent].includes(effort)) {
+    throw new Error(`Use one of ${efforts[agent].join(", ")} for the ${agent} effort.`);
   }
 
   if (!/^[\x21-\x7e]+$/.test(credential)) {
@@ -316,7 +354,7 @@ export async function runAgent({
     );
   }
 
-  const provider = providers[agent];
+  const provider = providers[auth][agent];
   const home = await mkdtemp(join(tmpdir(), "next-upgrade-agent-"));
   const replies = await mkdtemp("/var/tmp/next-upgrade-reply-");
   const reportSchemaPath = join(home, "report-schema.json");
@@ -359,8 +397,8 @@ export async function runAgent({
         `model_provider = "next_upgrade"
 approval_policy = "never"
 [model_providers.next_upgrade]
-name = "OpenAI"
-base_url = "${proxy.origin}/v1"
+name = "${provider.name}"
+base_url = "${proxy.origin}${provider.basePath}/v1"
 env_key = "NEXT_UPGRADE_PROXY_TOKEN"
 wire_api = "responses"
 [sandbox_workspace_write]
@@ -372,7 +410,7 @@ exclude = ["NEXT_UPGRADE_PROXY_TOKEN"]
     } else {
       env.CLAUDE_CONFIG_DIR = join(home, ".claude");
       env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
-      env.ANTHROPIC_BASE_URL = proxy.origin;
+      env.ANTHROPIC_BASE_URL = `${proxy.origin}${provider.basePath}`;
       env.ANTHROPIC_API_KEY = proxy.token;
       env.BASH_DEFAULT_TIMEOUT_MS = commandTimeout;
       env.BASH_MAX_TIMEOUT_MS = commandTimeout;
