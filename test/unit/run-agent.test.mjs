@@ -2,20 +2,28 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
-import { request as httpRequest } from "node:http";
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import { createServer as createHttpsServer, globalAgent } from "node:https";
-import { connect } from "node:net";
+import { connect, createServer as createNetServer } from "node:net";
 import { join } from "node:path";
 import { describe, test } from "node:test";
 
-import { providers, proxyTokenPattern, startAgentProxy } from "../../scripts/run-agent.mjs";
+import {
+  providers,
+  proxyTokenPattern,
+  startAgentProxy,
+  startNetworkProxy,
+} from "../../scripts/run-agent.mjs";
 import { tempDirectory } from "./utils.mjs";
 
 const unreachableOrigin = "https://127.0.0.1:1";
 
-async function startProxy({ t, agent, origin }) {
+async function startProxy({ t, agent, auth, origin }) {
   const proxy = await startAgentProxy({
-    provider: { ...providers[agent], origin: origin === undefined ? unreachableOrigin : origin },
+    provider: {
+      ...providers[auth ?? "api-key"][agent],
+      origin: origin === undefined ? unreachableOrigin : origin,
+    },
     credential: "real-credential",
   });
   t.after(() => proxy.close());
@@ -314,7 +322,7 @@ describe("startAgentProxy", () => {
 
   test("close resolves and stops accepting connections", async () => {
     const proxy = await startAgentProxy({
-      provider: { ...providers.codex, origin: unreachableOrigin },
+      provider: { ...providers["api-key"].codex, origin: unreachableOrigin },
       credential: "real-credential",
     });
     assert.equal(await proxy.close(), undefined);
@@ -382,6 +390,64 @@ describe("startAgentProxy", () => {
   );
 
   test(
+    "AI Gateway requests stay on the agent's compatibility path and carry the key as a bearer token",
+    { skip: hasOpenssl() ? false : "openssl is not installed" },
+    async (t) => {
+      const upstream = await startUpstream({ t });
+      const codex = await startProxy({
+        t,
+        agent: "codex",
+        auth: "ai-gateway",
+        origin: upstream.origin,
+      });
+      const claude = await startProxy({
+        t,
+        agent: "claude",
+        auth: "ai-gateway",
+        origin: upstream.origin,
+      });
+      const cases = [
+        { proxy: codex, method: "POST", path: "/codex/v1/responses", status: 201 },
+        { proxy: codex, method: "GET", path: "/codex/v1/models", status: 201 },
+        { proxy: codex, method: "POST", path: "/v1/responses", status: 403 },
+        { proxy: claude, method: "POST", path: "/claude-code/v1/messages", status: 201 },
+        {
+          proxy: claude,
+          method: "POST",
+          path: "/claude-code/v1/messages/count_tokens",
+          status: 201,
+        },
+        { proxy: claude, method: "POST", path: "/v1/messages", status: 403 },
+        { proxy: claude, method: "GET", path: "/v1/credits", status: 403 },
+      ];
+      for (const { proxy, method, path, status } of cases) {
+        const response = await send({
+          proxy,
+          method,
+          path,
+          headers: { authorization: `Bearer ${proxy.token}` },
+          body: method === "POST" ? "{}" : undefined,
+        });
+        assert.equal(response.status, status, `${method} ${path}`);
+      }
+
+      assert.deepEqual(
+        upstream.seen.map(({ url }) => url),
+        [
+          "/codex/v1/responses",
+          "/codex/v1/models",
+          "/claude-code/v1/messages",
+          "/claude-code/v1/messages/count_tokens",
+        ],
+      );
+      for (const seen of upstream.seen) {
+        assert.equal(seen.headers.authorization, "Bearer real-credential");
+        assert.equal(seen.headers["x-api-key"], undefined);
+      }
+    },
+  );
+
+  test(
     "the agent's anthropic-version header is kept",
     { skip: hasOpenssl() ? false : "openssl is not installed" },
     async (t) => {
@@ -397,4 +463,103 @@ describe("startAgentProxy", () => {
       assert.equal(upstream.seen[0].headers["anthropic-version"], "2099-01-01");
     },
   );
+});
+
+describe("startNetworkProxy", () => {
+  test("forwards plain HTTP requests and CONNECT tunnels to any host", async (t) => {
+    const upstream = createHttpServer((request, response) => {
+      response.end(`${request.method} ${request.url}`);
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const echo = createNetServer((socket) => socket.pipe(socket));
+    echo.listen(0, "127.0.0.1");
+    await once(echo, "listening");
+    const proxy = await startNetworkProxy();
+    t.after(async () => {
+      await proxy.close();
+      upstream.close();
+      echo.close();
+    });
+
+    const plain = await new Promise((resolve, reject) => {
+      const request = httpRequest(
+        {
+          host: "127.0.0.1",
+          port: proxy.port,
+          path: `http://127.0.0.1:${upstream.address().port}/v1/data?x=1`,
+          headers: { connection: "close" },
+        },
+        (response) => {
+          let body = "";
+          response.on("data", (chunk) => (body += chunk));
+          response.on("end", () => resolve({ status: response.statusCode, body }));
+        },
+      );
+      request.on("error", reject);
+      request.end();
+    });
+    assert.deepEqual(plain, { status: 200, body: "GET /v1/data?x=1" });
+
+    const refused = await new Promise((resolve, reject) => {
+      const request = httpRequest(
+        {
+          host: "127.0.0.1",
+          port: proxy.port,
+          path: "https://127.0.0.1:1/",
+          headers: { connection: "close" },
+        },
+        (response) => {
+          response.resume();
+          resolve(response.statusCode);
+        },
+      );
+      request.on("error", reject);
+      request.end();
+    });
+    assert.equal(refused, 400);
+
+    const tunneled = await new Promise((resolve, reject) => {
+      const socket = connect(proxy.port, "127.0.0.1", () => {
+        socket.write(
+          `CONNECT 127.0.0.1:${echo.address().port} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`,
+        );
+      });
+      let reply = "";
+      socket.on("data", (chunk) => {
+        reply += chunk;
+        if (reply.endsWith("\r\n\r\n")) {
+          socket.write("ping");
+        } else if (reply.endsWith("ping")) {
+          socket.end();
+          resolve(reply);
+        }
+      });
+      socket.on("error", reject);
+    });
+    assert.equal(tunneled, "HTTP/1.1 200 Connection Established\r\n\r\nping");
+  });
+
+  test("survives a client that resets a CONNECT tunnel while it is being dialed", async (t) => {
+    const proxy = await startNetworkProxy();
+    t.after(() => proxy.close());
+    const socket = connect(proxy.port, "127.0.0.1", () => {
+      socket.write("CONNECT 192.0.2.1:443 HTTP/1.1\r\nHost: 192.0.2.1\r\n\r\n");
+      setTimeout(() => socket.resetAndDestroy(), 50);
+    });
+    await once(socket, "close");
+
+    const status = await new Promise((resolve, reject) => {
+      const request = httpRequest(
+        { host: "127.0.0.1", port: proxy.port, path: "ftp://127.0.0.1/" },
+        (response) => {
+          response.resume();
+          resolve(response.statusCode);
+        },
+      );
+      request.on("error", reject);
+      request.end();
+    });
+    assert.equal(status, 400);
+  });
 });

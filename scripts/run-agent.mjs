@@ -3,8 +3,9 @@ import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { constants } from "node:fs";
 import { chmod, mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pipeline } from "node:stream";
@@ -16,25 +17,63 @@ import { commandEnv, run, showOutput, sudo, systemCommand, systemPath } from "./
 const exec = promisify(execFile);
 
 export const providers = {
-  codex: {
-    origin: "https://api.openai.com",
-    name: "OpenAI",
-    endpoints: ["POST /v1/responses", "POST /v1/responses/compact", "GET /v1/models"],
-    efforts: ["minimal", "low", "medium", "high", "xhigh"],
-    authorize({ headers, credential }) {
-      headers.authorization = `Bearer ${credential}`;
+  "api-key": {
+    codex: {
+      origin: "https://api.openai.com",
+      name: "OpenAI",
+      basePath: "",
+      checkPath: "/v1/models",
+      endpoints: ["POST /v1/responses", "POST /v1/responses/compact", "GET /v1/models"],
+      authorize({ headers, credential }) {
+        headers.authorization = `Bearer ${credential}`;
+      },
+    },
+    claude: {
+      origin: "https://api.anthropic.com",
+      name: "Anthropic",
+      basePath: "",
+      checkPath: "/v1/models",
+      endpoints: ["POST /v1/messages", "POST /v1/messages/count_tokens", "GET /v1/models"],
+      authorize({ headers, credential }) {
+        headers["x-api-key"] = credential;
+        headers["anthropic-version"] ??= "2023-06-01";
+      },
     },
   },
-  claude: {
-    origin: "https://api.anthropic.com",
-    name: "Anthropic",
-    endpoints: ["POST /v1/messages", "POST /v1/messages/count_tokens", "GET /v1/models"],
-    efforts: ["low", "medium", "high", "xhigh", "max"],
-    authorize({ headers, credential }) {
-      headers["x-api-key"] = credential;
-      headers["anthropic-version"] ??= "2023-06-01";
+  "ai-gateway": {
+    codex: {
+      origin: "https://ai-gateway.vercel.sh",
+      name: "Vercel AI Gateway",
+      basePath: "/codex",
+      checkPath: "/v1/credits",
+      endpoints: [
+        "POST /codex/v1/responses",
+        "POST /codex/v1/responses/compact",
+        "GET /codex/v1/models",
+      ],
+      authorize({ headers, credential }) {
+        headers.authorization = `Bearer ${credential}`;
+      },
+    },
+    claude: {
+      origin: "https://ai-gateway.vercel.sh",
+      name: "Vercel AI Gateway",
+      basePath: "/claude-code",
+      checkPath: "/v1/credits",
+      endpoints: [
+        "POST /claude-code/v1/messages",
+        "POST /claude-code/v1/messages/count_tokens",
+        "GET /claude-code/v1/models",
+      ],
+      authorize({ headers, credential }) {
+        headers.authorization = `Bearer ${credential}`;
+      },
     },
   },
+};
+const efforts = {
+  codex: ["minimal", "low", "medium", "high", "xhigh"],
+  claude: ["low", "medium", "high", "xhigh", "max"],
 };
 
 export const agentUser = "next-upgrade-agent";
@@ -55,7 +94,7 @@ const commandTimeout = String(30 * 60_000);
 async function checkApiKey({ provider, credential }) {
   const headers = {};
   provider.authorize({ headers, credential });
-  const response = await fetch(new URL("/v1/models", provider.origin), { headers }).catch(
+  const response = await fetch(new URL(provider.checkPath, provider.origin), { headers }).catch(
     (error) => {
       throw new Error(`Could not reach ${provider.name} to check the API key.`, { cause: error });
     },
@@ -207,6 +246,98 @@ export async function startAgentProxy({ provider, credential }) {
   };
 }
 
+// Claude Code's sandbox gives the commands it runs no network, so they reach hosts through this.
+export async function startNetworkProxy() {
+  const tunnels = new Set();
+  let closing = false;
+  const report = (target) => (error) => {
+    if (error && !closing) {
+      console.error(`The network proxy connection to ${target} failed: ${error.message}.`);
+    }
+  };
+
+  const server = createServer((request, response) => {
+    let target;
+    try {
+      target = new URL(request.url);
+      if (target.protocol !== "http:") {
+        throw new Error("only http: targets are forwarded, others go through CONNECT");
+      }
+    } catch (error) {
+      console.error(`The network proxy refused ${request.url}: ${error.message}.`);
+      request.resume();
+      response.writeHead(400).end();
+      return;
+    }
+
+    const { "proxy-connection": proxyConnection, ...headers } = request.headers;
+    const forwarded = httpRequest(target, { method: request.method, headers }, (reply) => {
+      response.writeHead(reply.statusCode, reply.headers);
+      pipeline(reply, response, report(target.host));
+    });
+    forwarded.on("error", () => {
+      if (!response.headersSent) {
+        response.writeHead(502);
+      }
+
+      response.end();
+    });
+    pipeline(request, forwarded, report(target.host));
+  });
+  server.on("connect", (request, socket, head) => {
+    tunnels.add(socket);
+    socket.on("close", () => tunnels.delete(socket));
+    let upstream = null;
+    socket.on("error", (error) => {
+      if (upstream === null) {
+        report(request.url)(error);
+      } else if (upstream.connecting) {
+        report(request.url)(error);
+        upstream.destroy();
+      }
+    });
+    let target;
+    try {
+      // A scheme with no default port keeps an explicit :80.
+      target = new URL(`tcp://${request.url}`);
+    } catch (error) {
+      console.error(`The network proxy refused CONNECT ${request.url}: ${error.message}.`);
+      socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+      return;
+    }
+
+    upstream = connect(
+      { host: target.hostname.replace(/^\[|\]$/gu, ""), port: Number(target.port || 443) },
+      () => {
+        socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        upstream.write(head);
+        pipeline(upstream, socket, report(target.host));
+        pipeline(socket, upstream, report(target.host));
+      },
+    );
+    upstream.on("error", (error) => {
+      report(target.host)(error);
+      socket.destroy();
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+
+  return {
+    port: server.address().port,
+    close: async () => {
+      closing = true;
+      for (const socket of tunnels) {
+        socket.destroy();
+      }
+
+      server.closeAllConnections();
+      server.close();
+      await once(server, "close");
+    },
+  };
+}
+
 async function agentProcessesRunning() {
   try {
     await exec(systemCommand("pgrep"), ["-u", agentUser], {
@@ -260,9 +391,22 @@ export async function stopAgent() {
   throw new Error("Could not stop the agent processes.");
 }
 
-export function runAsAgentUser({ file, args, env, ...options }) {
+// The OAuth token reaches the command through stdin, so it is never part of a command line.
+export function runAsAgentUser({ file, args, env, oauthToken, ...options }) {
+  const command =
+    oauthToken === undefined
+      ? [file, ...args]
+      : [
+          "/bin/sh",
+          "-c",
+          'IFS= read -r CLAUDE_CODE_OAUTH_TOKEN && export CLAUDE_CODE_OAUTH_TOKEN && exec "$@" </dev/null',
+          "sh",
+          file,
+          ...args,
+        ];
   return run({
     ...options,
+    input: oauthToken === undefined ? undefined : `${oauthToken}\n`,
     file: systemCommand("sudo"),
     args: [
       "-n",
@@ -280,8 +424,7 @@ export function runAsAgentUser({ file, args, env, ...options }) {
       systemCommand("env"),
       "-i",
       ...Object.entries(env).map(([name, value]) => `${name}=${value}`),
-      file,
-      ...args,
+      ...command,
     ],
     env: commandEnv(),
   });
@@ -298,16 +441,16 @@ export async function runAgent({
   cwd,
   prompt,
 }) {
-  if (!Object.hasOwn(providers, agent)) {
+  if (!Object.hasOwn(efforts, agent)) {
     throw new Error("Use codex or claude for the agent.");
   }
 
-  if (auth !== "api-key") {
-    throw new Error("Only api-key auth is supported for now.");
+  if (auth === "subscription" ? agent !== "claude" : !Object.hasOwn(providers, auth)) {
+    throw new Error("Use api-key or ai-gateway for the auth, or subscription with claude.");
   }
 
-  if (effort !== undefined && !providers[agent].efforts.includes(effort)) {
-    throw new Error(`Use one of ${providers[agent].efforts.join(", ")} for the ${agent} effort.`);
+  if (effort !== undefined && !efforts[agent].includes(effort)) {
+    throw new Error(`Use one of ${efforts[agent].join(", ")} for the ${agent} effort.`);
   }
 
   if (!/^[\x21-\x7e]+$/.test(credential)) {
@@ -316,14 +459,20 @@ export async function runAgent({
     );
   }
 
-  const provider = providers[agent];
+  const subscription = auth === "subscription";
+  const provider = subscription ? null : providers[auth][agent];
   const home = await mkdtemp(join(tmpdir(), "next-upgrade-agent-"));
   const replies = await mkdtemp("/var/tmp/next-upgrade-reply-");
   const reportSchemaPath = join(home, "report-schema.json");
   let proxy;
+  let networkProxy;
   const cleanup = async () => {
     if (proxy) {
       await proxy.close();
+    }
+
+    if (networkProxy) {
+      await networkProxy.close();
     }
 
     await stopAgent();
@@ -339,8 +488,12 @@ export async function runAgent({
   };
 
   try {
-    await checkApiKey({ provider, credential });
-    proxy = await startAgentProxy({ provider, credential });
+    if (subscription) {
+      networkProxy = await startNetworkProxy();
+    } else {
+      await checkApiKey({ provider, credential });
+      proxy = await startAgentProxy({ provider, credential });
+    }
 
     const env = {
       ...commandEnv(),
@@ -359,8 +512,8 @@ export async function runAgent({
         `model_provider = "next_upgrade"
 approval_policy = "never"
 [model_providers.next_upgrade]
-name = "OpenAI"
-base_url = "${proxy.origin}/v1"
+name = "${provider.name}"
+base_url = "${proxy.origin}${provider.basePath}/v1"
 env_key = "NEXT_UPGRADE_PROXY_TOKEN"
 wire_api = "responses"
 [sandbox_workspace_write]
@@ -372,8 +525,14 @@ exclude = ["NEXT_UPGRADE_PROXY_TOKEN"]
     } else {
       env.CLAUDE_CONFIG_DIR = join(home, ".claude");
       env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
-      env.ANTHROPIC_BASE_URL = proxy.origin;
-      env.ANTHROPIC_API_KEY = proxy.token;
+      if (subscription) {
+        // Keeps the subscription token from the commands Claude Code runs.
+        env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB = "1";
+      } else {
+        env.ANTHROPIC_BASE_URL = `${proxy.origin}${provider.basePath}`;
+        env.ANTHROPIC_API_KEY = proxy.token;
+      }
+
       env.BASH_DEFAULT_TIMEOUT_MS = commandTimeout;
       env.BASH_MAX_TIMEOUT_MS = commandTimeout;
     }
@@ -416,7 +575,7 @@ exclude = ["NEXT_UPGRADE_PROXY_TOKEN"]
           tool: tool_name,
           input: tool_input,
         }));
-        console.error(`Auto mode denied: ${JSON.stringify(denied)}`);
+        console.error(`Permission denials: ${JSON.stringify(denied)}`);
       }
 
       throw new Error(`${label} did not confirm app verification.`);
@@ -460,17 +619,35 @@ exclude = ["NEXT_UPGRADE_PROXY_TOKEN"]
       const output = await runAsAgentUser({
         ...agentOptions,
         file: "claude",
+        oauthToken: subscription ? credential : undefined,
         args: [
           "--print",
-          "--bare",
+          // --bare never reads a subscription token.
+          ...(subscription ? [] : ["--bare"]),
           ...modelArgs,
           "--output-format",
           "json",
           "--json-schema",
           JSON.stringify(reportSchema),
           "--no-session-persistence",
-          "--permission-mode",
-          "auto",
+          // The scrub forces the default permission mode, so the tools an upgrade uses are
+          // allowed by name. Reads stay in the working directories, which default mode
+          // allows; one outside, such as Claude Code's /proc entries, would reach the token.
+          ...(subscription
+            ? [
+                "--allowedTools",
+                `Bash,Edit(/${root}/**)`,
+                "--settings",
+                JSON.stringify({
+                  sandbox: {
+                    enabled: true,
+                    failIfUnavailable: true,
+                    allowUnsandboxedCommands: false,
+                    network: { httpProxyPort: networkProxy.port },
+                  },
+                }),
+              ]
+            : ["--permission-mode", "auto"]),
           "--permission-prompts",
           "none",
           "--setting-sources",
