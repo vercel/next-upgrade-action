@@ -212,8 +212,18 @@ jobs:
               exit 1
               ;;
           esac
-      - name: Allow the Codex sandbox
-        if: ${{ inputs.agent == 'codex' }}
+      - name: Install the Claude Code sandbox for a Claude subscription
+        if: ${{ inputs.agent == 'claude' && inputs.auth == 'subscription' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap socat
+          # This profile strips the capabilities the sandbox's seccomp helper needs.
+          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo apparmor_parser --remove /etc/apparmor.d/bwrap-userns-restrict
+          fi
+      - name: Allow the agent sandbox
+        if: ${{ inputs.agent == 'codex' || inputs.auth == 'subscription' }}
         run: |
           set -euo pipefail
           for setting in kernel.unprivileged_userns_clone=1 kernel.apparmor_restrict_unprivileged_userns=0; do
